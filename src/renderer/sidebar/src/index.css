@@ -105,3 +105,67 @@
   background: #a8a8a8;
 }
 
+@keyframes bbPulseScale {
+  0%,
+  100% {
+    transform: scale(0.92);
+  }
+  50% {
+    transform: scale(1.08);
+  }
+}
+
+.bb-pulse-scale {
+  animation: bbPulseScale 1.1s ease-in-out infinite;
+  transform-origin: center;
+}
+
+.hljs {
+  color: rgb(var(--foreground));
+  background: transparent;
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: rgba(var(--muted-foreground), 0.9);
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-subst {
+  color: #c792ea;
+}
+
+.hljs-string,
+.hljs-title,
+.hljs-section,
+.hljs-attribute,
+.hljs-literal,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-type,
+.hljs-addition {
+  color: #c3e88d;
+}
+
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-variable,
+.hljs-built_in {
+  color: #f78c6c;
+}
+
+.hljs-meta,
+.hljs-doctag {
+  color: #82aaff;
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
+
+.hljs-strong {
+  font-weight: 700;
+}
+

@@ -139,8 +139,11 @@ export const AddressBar: React.FC = () => {
             {/* Address Bar */}
             {isFocused ? (
                 // Expanded State
-                <form onSubmit={handleSubmit} className="flex-1 min-w-0 max-w-full">
-                    <div className="bg-background rounded-lg shadow-md p-1 dark:bg-secondary">
+                <form
+                    onSubmit={handleSubmit}
+                    className="flex-1 min-w-0 max-w-full app-region-no-drag"
+                >
+                    <div className="bg-background rounded-lg shadow-md p-1 dark:bg-secondary app-region-no-drag">
                         <input
                             type="text"
                             value={url}
@@ -148,7 +151,7 @@ export const AddressBar: React.FC = () => {
                             onFocus={handleFocus}
                             onBlur={handleBlur}
                             onKeyDown={handleKeyDown}
-                            className="w-full px-1 py-0.5 text-xs outline-none bg-transparent text-foreground truncate"
+                            className="w-full px-1 py-0.5 text-xs outline-none bg-transparent text-foreground truncate app-region-no-drag select-text cursor-text"
                             placeholder={activeTab ? "Enter URL or search term" : "No active tab"}
                             disabled={!activeTab}
                             spellCheck={false}

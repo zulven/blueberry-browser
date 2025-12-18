@@ -1,8 +1,9 @@
 import React, { useState, useRef, useEffect, useLayoutEffect } from 'react'
 import ReactMarkdown from 'react-markdown'
+import rehypeHighlight from 'rehype-highlight'
 import remarkGfm from 'remark-gfm'
 import remarkBreaks from 'remark-breaks'
-import { ArrowUp, Square, Sparkles, Plus } from 'lucide-react'
+import { ArrowUp, ChevronDown, ChevronUp, Plus } from 'lucide-react'
 import { useChat } from '../contexts/ChatContext'
 import { cn } from '@common/lib/utils'
 import { Button } from '@common/components/Button'
@@ -52,13 +53,14 @@ const StreamingText: React.FC<{ content: string }> = ({ content }) => {
     const [currentIndex, setCurrentIndex] = useState(0)
 
     useEffect(() => {
-        if (currentIndex < content.length) {
-            const timer = setTimeout(() => {
-                setDisplayedContent(content.slice(0, currentIndex + 1))
-                setCurrentIndex(currentIndex + 1)
-            }, 10)
-            return () => clearTimeout(timer)
-        }
+        if (currentIndex >= content.length) return undefined
+
+        const timer = setTimeout(() => {
+            setDisplayedContent(content.slice(0, currentIndex + 1))
+            setCurrentIndex(currentIndex + 1)
+        }, 10)
+
+        return () => clearTimeout(timer)
     }, [content, currentIndex])
 
     return (
@@ -72,28 +74,78 @@ const StreamingText: React.FC<{ content: string }> = ({ content }) => {
 }
 
 // Markdown Renderer Component
-const Markdown: React.FC<{ content: string }> = ({ content }) => (
-    <div className="prose prose-sm dark:prose-invert max-w-none 
-                    prose-headings:text-foreground prose-p:text-foreground 
-                    prose-strong:text-foreground prose-ul:text-foreground 
-                    prose-ol:text-foreground prose-li:text-foreground
-                    prose-a:text-primary hover:prose-a:underline
-                    prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 
-                    prose-code:rounded prose-code:text-sm prose-code:text-foreground
-                    prose-pre:bg-muted dark:prose-pre:bg-muted/50 prose-pre:p-3 
-                    prose-pre:rounded-lg prose-pre:overflow-x-auto">
+const Markdown: React.FC<{ content: string; className?: string }> = ({ content, className }) => (
+    <div className={cn(
+        `prose prose-sm dark:prose-invert max-w-none
+        prose-headings:text-foreground prose-p:text-foreground
+        prose-strong:text-foreground prose-ul:text-foreground
+        prose-ol:text-foreground prose-li:text-foreground
+        prose-a:text-primary hover:prose-a:underline
+        prose-code:bg-muted prose-code:px-1 prose-code:py-0.5
+        prose-code:rounded prose-code:text-sm prose-code:text-foreground
+        prose-pre:bg-muted dark:prose-pre:bg-muted/50 prose-pre:p-3
+        prose-pre:rounded-lg prose-pre:overflow-x-auto`,
+        className
+    )}>
         <ReactMarkdown
             remarkPlugins={[remarkGfm, remarkBreaks]}
+            rehypePlugins={[rehypeHighlight]}
             components={{
+                h1: ({ children }) => (
+                    <h1 className="mt-6 mb-3 text-2xl font-semibold tracking-tight text-foreground">
+                        {children}
+                    </h1>
+                ),
+                h2: ({ children }) => (
+                    <h2 className="mt-5 mb-3 text-xl font-semibold tracking-tight text-foreground">
+                        {children}
+                    </h2>
+                ),
+                h3: ({ children }) => (
+                    <h3 className="mt-4 mb-2 text-lg font-semibold tracking-tight text-foreground">
+                        {children}
+                    </h3>
+                ),
+                h4: ({ children }) => (
+                    <h4 className="mt-4 mb-2 text-base font-semibold tracking-tight text-foreground">
+                        {children}
+                    </h4>
+                ),
+                table: ({ children }) => (
+                    <div className="my-4 w-full overflow-x-auto rounded-lg border border-border">
+                        <table className="w-full border-collapse text-sm">{children}</table>
+                    </div>
+                ),
+                thead: ({ children }) => (
+                    <thead className="bg-muted/40 dark:bg-muted/20">{children}</thead>
+                ),
+                th: ({ children }) => (
+                    <th className="border-b border-border px-3 py-2 text-left font-medium text-foreground">
+                        {children}
+                    </th>
+                ),
+                td: ({ children }) => (
+                    <td className="border-b border-border px-3 py-2 align-top text-foreground">
+                        {children}
+                    </td>
+                ),
+                pre: ({ children }) => (
+                    <pre className="my-4 overflow-x-auto rounded-lg bg-muted/60 dark:bg-muted/30 p-3">
+                        {children}
+                    </pre>
+                ),
                 // Custom code block styling
                 code: ({ node, className, children, ...props }) => {
                     const inline = !className
                     return inline ? (
-                        <code className="bg-muted dark:bg-muted/50 px-1 py-0.5 rounded text-sm text-foreground" {...props}>
+                        <code
+                            className="bg-muted dark:bg-muted/50 px-1 py-0.5 rounded text-sm text-foreground"
+                            {...props}
+                        >
                             {children}
                         </code>
                     ) : (
-                        <code className={className} {...props}>
+                        <code className={cn("font-mono text-sm", className)} {...props}>
                             {children}
                         </code>
                     )
@@ -121,7 +173,7 @@ const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean }> = (
     content,
     isStreaming
 }) => (
-    <div className="relative w-full animate-fade-in">
+    <div className="relative w-full animate-fade-in pl-4">
         <div className="py-1">
             {isStreaming ? (
                 <StreamingText content={content} />
@@ -132,7 +184,7 @@ const AssistantMessage: React.FC<{ content: string; isStreaming?: boolean }> = (
     </div>
 )
 
-// Loading Indicator with spinning star
+// Loading Indicator with spinning blueberry
 const LoadingIndicator: React.FC = () => {
     const [isVisible, setIsVisible] = useState(false)
 
@@ -145,7 +197,9 @@ const LoadingIndicator: React.FC = () => {
             "transition-transform duration-300 ease-in-out",
             isVisible ? "scale-100" : "scale-0"
         )}>
-            ...
+            <span className="inline-flex items-center justify-center" aria-label="Loading">
+                <span className="inline-block select-none bb-pulse-scale text-lg leading-none">🫐</span>
+            </span>
         </div>
     )
 }
@@ -244,26 +298,201 @@ interface ConversationTurn {
 const ConversationTurnComponent: React.FC<{
     turn: ConversationTurn
     isLoading?: boolean
-}> = ({ turn, isLoading }) => (
-    <div className="pt-12 flex flex-col gap-8">
-        {turn.user && <UserMessage content={turn.user.content} />}
-        {turn.assistant && (
-            <AssistantMessage
-                content={turn.assistant.content}
-                isStreaming={turn.assistant.isStreaming}
-            />
-        )}
-        {isLoading && (
-            <div className="flex justify-start">
-                <LoadingIndicator />
-            </div>
-        )}
-    </div>
-)
+    reasoning?: string
+    isReasoningComplete?: boolean
+    navigation?: string
+    isNavigationComplete?: boolean
+}> = ({ turn, isLoading, reasoning, isReasoningComplete, navigation, isNavigationComplete }) => {
+    const [isReasoningCollapsed, setIsReasoningCollapsed] = useState(false)
+    const [isNavigationCollapsed, setIsNavigationCollapsed] = useState(false)
+
+    const [thinkingStartedAt, setThinkingStartedAt] = useState<number | null>(null)
+    const [thinkingElapsedMs, setThinkingElapsedMs] = useState<number>(0)
+
+    useEffect(() => {
+        if (!reasoning || reasoning.length === 0) return
+
+        if (isReasoningComplete) {
+            setIsReasoningCollapsed(true)
+        } else {
+            setIsReasoningCollapsed(false)
+        }
+    }, [reasoning, isReasoningComplete])
+
+    useEffect(() => {
+        if (!navigation || navigation.length === 0) return
+
+        if (isNavigationComplete) {
+            setIsNavigationCollapsed(true)
+        } else {
+            setIsNavigationCollapsed(false)
+        }
+    }, [navigation, isNavigationComplete])
+
+    useEffect(() => {
+        if (!reasoning || reasoning.length === 0) return
+
+        if (!isReasoningComplete) {
+            setThinkingStartedAt((prev) => prev ?? Date.now())
+            return
+        }
+
+        setThinkingElapsedMs((prev) => {
+            const startedAt = thinkingStartedAt
+            if (!startedAt) return prev
+            return Date.now() - startedAt
+        })
+    }, [reasoning, isReasoningComplete, thinkingStartedAt])
+
+    useEffect(() => {
+        if (!reasoning || reasoning.length === 0) return
+        if (isReasoningComplete) return
+        if (!thinkingStartedAt) return
+
+        const id = window.setInterval(() => {
+            setThinkingElapsedMs(Date.now() - thinkingStartedAt)
+        }, 100)
+
+        return () => window.clearInterval(id)
+    }, [reasoning, isReasoningComplete, thinkingStartedAt])
+
+    return (
+        <div className="pt-12 flex flex-col gap-8">
+            {turn.user && <UserMessage content={turn.user.content} />}
+
+            {turn.user && reasoning && reasoning.length > 0 && (
+                <div className="pt-4">
+                    <div className="rounded-2xl border border-border bg-muted/40 dark:bg-muted/20 p-4">
+                        <div className="flex items-center justify-between gap-3 mb-2">
+                            <div className="text-xs font-medium text-muted-foreground flex items-center gap-2">
+
+                                <span
+                                    className={cn(
+                                        "inline-block size-2.5 rounded-full",
+                                        "shadow-[0_0_0_2px_rgba(255,255,255,0.04)]",
+                                        !isReasoningComplete
+                                            ? "animate-pulse bg-muted-foreground/50"
+                                            : "bg-teal-400/75"
+                                    )}
+                                />
+
+                                {!isReasoningComplete
+                                    ? 'Thinking'
+                                    : `Thought for ${Math.max(0, thinkingElapsedMs / 1000).toFixed(1)}s`}
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setIsReasoningCollapsed((v) => !v)}
+                                className={cn(
+                                    "inline-flex items-center justify-center",
+                                    "size-7 rounded-md",
+                                    "text-muted-foreground hover:text-foreground",
+                                    "hover:bg-muted/70 dark:hover:bg-muted/30"
+                                )}
+                                aria-label={isReasoningCollapsed ? 'Expand reasoning' : 'Collapse reasoning'}
+                                title={isReasoningCollapsed ? 'Expand reasoning' : 'Collapse reasoning'}
+                            >
+                                {isReasoningCollapsed ? (
+                                    <ChevronDown className="size-4" />
+                                ) : (
+                                    <ChevronUp className="size-4" />
+                                )}
+                            </button>
+                        </div>
+
+                        <div
+                            className={cn(
+                                "origin-bottom transition-all duration-200",
+                                isReasoningCollapsed
+                                    ? "scale-y-0 opacity-0 max-h-0 pointer-events-none"
+                                    : "scale-y-100 opacity-100 max-h-[1000px]"
+                            )}
+                        >
+                            <Markdown
+                                content={reasoning}
+                                className="opacity-55 prose-p:text-muted-foreground/45 prose-li:text-muted-foreground/45 prose-headings:text-muted-foreground/45 prose-strong:text-foreground/60 prose-code:text-muted-foreground/50"
+                            />
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {turn.user && navigation && navigation.length > 0 && (
+                <div className="pt-4">
+                    <div className="rounded-2xl border border-border bg-muted/40 dark:bg-muted/20 p-4">
+
+                        <div className="flex items-center justify-between gap-3 mb-2">
+                            <div className="text-xs font-medium text-muted-foreground flex items-center gap-2">
+                                <span
+                                    className={cn(
+                                        "inline-block size-2.5 rounded-full",
+                                        "shadow-[0_0_0_2px_rgba(255,255,255,0.04)]",
+                                        !isNavigationComplete
+                                            ? "animate-pulse bg-muted-foreground/50"
+                                            : "bg-indigo-400/75"
+                                    )}
+                                />
+
+                                {!isNavigationComplete ? 'Navigation' : 'Navigation log'}
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setIsNavigationCollapsed((v) => !v)}
+
+                                className={cn(
+                                    "inline-flex items-center justify-center",
+                                    "size-7 rounded-md",
+                                    "text-muted-foreground hover:text-foreground",
+                                    "hover:bg-muted/70 dark:hover:bg-muted/30"
+                                )}
+                                aria-label={isNavigationCollapsed ? 'Expand navigation' : 'Collapse navigation'}
+                                title={isNavigationCollapsed ? 'Expand navigation' : 'Collapse navigation'}
+                            >
+                                {isNavigationCollapsed ? (
+                                    <ChevronDown className="size-4" />
+                                ) : (
+                                    <ChevronUp className="size-4" />
+                                )}
+                            </button>
+                        </div>
+
+                        <div
+                            className={cn(
+                                "origin-bottom transition-all duration-200",
+                                isNavigationCollapsed
+                                    ? "scale-y-0 opacity-0 max-h-0 pointer-events-none"
+                                    : "scale-y-100 opacity-100 max-h-[1000px]"
+                            )}
+                        >
+                            <Markdown
+                                content={navigation}
+                                className="opacity-55 prose-p:text-muted-foreground/45 prose-li:text-muted-foreground/45 prose-headings:text-muted-foreground/45 prose-strong:text-foreground/60 prose-code:text-muted-foreground/50"
+                            />
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {turn.assistant && (
+                <AssistantMessage
+                    content={turn.assistant.content}
+                    isStreaming={turn.assistant.isStreaming}
+                />
+            )}
+
+            {isLoading && (
+                <div className="flex justify-start">
+                    <LoadingIndicator />
+                </div>
+            )}
+        </div>
+    )
+}
 
 // Main Chat Component
 export const Chat: React.FC = () => {
-    const { messages, isLoading, sendMessage, clearChat } = useChat()
+    const { messages, isLoading, sendMessage, clearChat, reasoning, isReasoningComplete, navigation, isNavigationComplete } = useChat()
+
     const scrollRef = useAutoScroll(messages)
 
     // Group messages into conversation turns
@@ -291,6 +520,7 @@ export const Chat: React.FC = () => {
         <div className="flex flex-col h-full bg-background">
             {/* Messages Area */}
             <div className="flex-1 overflow-y-auto">
+
                 <div className="h-8 max-w-3xl mx-auto px-4">
                     {/* New Chat Button - Floating */}
                     {messages.length > 0 && (
@@ -306,10 +536,10 @@ export const Chat: React.FC = () => {
                 </div>
 
                 <div className="pb-4 relative max-w-3xl mx-auto px-4">
-
                     {messages.length === 0 ? (
                         // Empty State
                         <div className="flex items-center justify-center h-full min-h-[400px]">
+
                             <div className="text-center animate-fade-in max-w-md mx-auto gap-2 flex flex-col">
                                 <h3 className="text-2xl font-bold">🫐</h3>
                                 <p className="text-muted-foreground text-sm">
@@ -322,14 +552,33 @@ export const Chat: React.FC = () => {
 
                             {/* Render conversation turns */}
                             {conversationTurns.map((turn, index) => (
-                                <ConversationTurnComponent
-                                    key={`turn-${index}`}
-                                    turn={turn}
-                                    isLoading={
-                                        showLoadingAfterLastTurn &&
-                                        index === conversationTurns.length - 1
-                                    }
-                                />
+                                (() => {
+                                    const isLastTurn = index === conversationTurns.length - 1
+                                    const showReasoningInline =
+                                        isLastTurn &&
+                                        !!turn.user &&
+                                        reasoning.length > 0
+
+                                    const showNavigationInline =
+                                        isLastTurn &&
+                                        !!turn.user &&
+                                        navigation.length > 0
+
+                                    return (
+                                        <ConversationTurnComponent
+                                            key={`turn-${index}`}
+                                            turn={turn}
+                                            reasoning={showReasoningInline ? reasoning : undefined}
+                                            isReasoningComplete={isReasoningComplete}
+                                            navigation={showNavigationInline ? navigation : undefined}
+                                            isNavigationComplete={isNavigationComplete}
+                                            isLoading={
+                                                showLoadingAfterLastTurn &&
+                                                index === conversationTurns.length - 1
+                                            }
+                                        />
+                                    )
+                                })()
                             ))}
                         </>
                     )}

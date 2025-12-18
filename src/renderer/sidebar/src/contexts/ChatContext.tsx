@@ -12,6 +12,12 @@ interface ChatContextType {
     messages: Message[]
     isLoading: boolean
 
+    reasoning: string
+    isReasoningComplete: boolean
+
+    navigation: string
+    isNavigationComplete: boolean
+
     // Chat actions
     sendMessage: (content: string) => Promise<void>
     clearChat: () => void
@@ -35,6 +41,12 @@ export const useChat = () => {
 export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [messages, setMessages] = useState<Message[]>([])
     const [isLoading, setIsLoading] = useState(false)
+
+    const [reasoning, setReasoning] = useState('')
+    const [isReasoningComplete, setIsReasoningComplete] = useState(true)
+
+    const [navigation, setNavigation] = useState('')
+    const [isNavigationComplete, setIsNavigationComplete] = useState(true)
 
     // Load initial messages from main process
     useEffect(() => {
@@ -63,6 +75,11 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const sendMessage = useCallback(async (content: string) => {
         setIsLoading(true)
+        setReasoning('')
+        setIsReasoningComplete(false)
+
+        setNavigation('')
+        setIsNavigationComplete(false)
 
         try {
             const messageId = Date.now().toString()
@@ -76,7 +93,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
             // Messages will be updated via the chat-messages-updated event
         } catch (error) {
             console.error('Failed to send message:', error)
-        } finally {
             setIsLoading(false)
         }
     }, [])
@@ -85,6 +101,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         try {
             await window.sidebarAPI.clearChat()
             setMessages([])
+            setReasoning('')
+            setIsReasoningComplete(true)
+            setNavigation('')
+            setIsNavigationComplete(true)
         } catch (error) {
             console.error('Failed to clear chat:', error)
         }
@@ -121,8 +141,33 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     useEffect(() => {
         // Listen for streaming response updates
         const handleChatResponse = (data: { messageId: string; content: string; isComplete: boolean }) => {
+            if (data.content && data.content.length > 0) {
+                setIsLoading(false)
+                return
+            }
+
             if (data.isComplete) {
                 setIsLoading(false)
+            }
+        }
+
+        const handleChatReasoning = (data: { messageId: string; content: string; isComplete: boolean }) => {
+            if (data.content) {
+                setIsLoading(false)
+                setReasoning((prev) => prev + data.content)
+            }
+            if (data.isComplete) {
+                setIsReasoningComplete(true)
+            }
+        }
+
+        const handleChatNavigation = (data: { messageId: string; content: string; isComplete: boolean }) => {
+            if (data.content) {
+                setIsLoading(false)
+                setNavigation((prev) => prev + data.content)
+            }
+            if (data.isComplete) {
+                setIsNavigationComplete(true)
             }
         }
 
@@ -142,10 +187,14 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
 
         window.sidebarAPI.onChatResponse(handleChatResponse)
+        window.sidebarAPI.onChatReasoning(handleChatReasoning)
+        window.sidebarAPI.onChatNavigation(handleChatNavigation)
         window.sidebarAPI.onMessagesUpdated(handleMessagesUpdated)
 
         return () => {
             window.sidebarAPI.removeChatResponseListener()
+            window.sidebarAPI.removeChatReasoningListener()
+            window.sidebarAPI.removeChatNavigationListener()
             window.sidebarAPI.removeMessagesUpdatedListener()
         }
     }, [])
@@ -153,6 +202,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const value: ChatContextType = {
         messages,
         isLoading,
+
+        reasoning,
+        isReasoningComplete,
+
+        navigation,
+        isNavigationComplete,
         sendMessage,
         clearChat,
         getPageContent,

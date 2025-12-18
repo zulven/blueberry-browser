@@ -157,6 +157,16 @@ export class EventManager {
       return true;
     });
 
+    ipcMain.handle("sidebar-get-width", () => {
+      return this.mainWindow.sidebar.getWidth();
+    });
+
+    ipcMain.handle("sidebar-set-width", (_, width: number) => {
+      this.mainWindow.sidebar.setWidth(width);
+      this.mainWindow.updateAllBounds();
+      return this.mainWindow.sidebar.getWidth();
+    });
+
     // Chat message
     ipcMain.handle("sidebar-chat-message", async (_, request) => {
       // The LLMClient now handles getting the screenshot and context directly

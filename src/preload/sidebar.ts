@@ -17,8 +17,25 @@ interface ChatResponse {
   isComplete: boolean;
 }
 
+interface ChatReasoning {
+  messageId: string;
+  content: string;
+  isComplete: boolean;
+}
+
+interface ChatNavigation {
+  messageId: string;
+  content: string;
+  isComplete: boolean;
+}
+
 // Sidebar specific APIs
 const sidebarAPI = {
+  // Sidebar layout
+  getSidebarWidth: () => electronAPI.ipcRenderer.invoke("sidebar-get-width"),
+  setSidebarWidth: (width: number) =>
+    electronAPI.ipcRenderer.invoke("sidebar-set-width", width),
+
   // Chat functionality
   sendChatMessage: (request: Partial<ChatRequest>) =>
     electronAPI.ipcRenderer.invoke("sidebar-chat-message", request),
@@ -31,6 +48,14 @@ const sidebarAPI = {
     electronAPI.ipcRenderer.on("chat-response", (_, data) => callback(data));
   },
 
+  onChatReasoning: (callback: (data: ChatReasoning) => void) => {
+    electronAPI.ipcRenderer.on("chat-reasoning", (_, data) => callback(data));
+  },
+
+  onChatNavigation: (callback: (data: ChatNavigation) => void) => {
+    electronAPI.ipcRenderer.on("chat-navigation", (_, data) => callback(data));
+  },
+
   onMessagesUpdated: (callback: (messages: any[]) => void) => {
     electronAPI.ipcRenderer.on("chat-messages-updated", (_, messages) =>
       callback(messages)
@@ -39,6 +64,14 @@ const sidebarAPI = {
 
   removeChatResponseListener: () => {
     electronAPI.ipcRenderer.removeAllListeners("chat-response");
+  },
+
+  removeChatReasoningListener: () => {
+    electronAPI.ipcRenderer.removeAllListeners("chat-reasoning");
+  },
+
+  removeChatNavigationListener: () => {
+    electronAPI.ipcRenderer.removeAllListeners("chat-navigation");
   },
 
   removeMessagesUpdatedListener: () => {

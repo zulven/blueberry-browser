@@ -28,6 +28,8 @@ export class Window {
     this._topBar = new TopBar(this._baseWindow);
     this._sideBar = new SideBar(this._baseWindow);
 
+    // this._sideBar.view.webContents.openDevTools({mode: 'detach'});
+
     // Set the window reference on the LLM client to avoid circular dependency
     this._sideBar.client.setWindow(this);
 
@@ -47,14 +49,6 @@ export class Window {
           height: bounds.height,
         });
       }
-    });
-
-    // Handle external link opening
-    this.tabsMap.forEach((tab) => {
-      tab.webContents.setWindowOpenHandler((details) => {
-        shell.openExternal(details.url);
-        return { action: "deny" };
-      });
     });
 
     this.setupEventListeners();
@@ -93,15 +87,31 @@ export class Window {
     const tabId = `tab-${++this.tabCounter}`;
     const tab = new Tab(tabId, url);
 
+    tab.webContents.setWindowOpenHandler((details) => {
+      try {
+        const parsed = new URL(details.url);
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          this.createTab(details.url);
+          return { action: "deny" };
+        }
+      } catch {
+        // ignore URL parsing errors and fall through
+      }
+
+      shell.openExternal(details.url);
+      return { action: "deny" };
+    });
+
     // Add the tab's WebContentsView to the window
     this._baseWindow.contentView.addChildView(tab.view);
 
     // Set the bounds to fill the window below the topbar and to the left of sidebar
     const bounds = this._baseWindow.getBounds();
+    const sidebarWidth = this._sideBar.getIsVisible() ? this._sideBar.getWidth() : 0;
     tab.view.setBounds({
       x: 0,
       y: 88, // Start below the topbar
-      width: bounds.width - 400, // Subtract sidebar width
+      width: bounds.width - sidebarWidth,
       height: bounds.height - 88, // Subtract topbar height
     });
 
@@ -233,7 +243,7 @@ export class Window {
   private updateTabBounds(): void {
     const bounds = this._baseWindow.getBounds();
     // Only subtract sidebar width if it's visible
-    const sidebarWidth = this._sideBar.getIsVisible() ? 400 : 0;
+    const sidebarWidth = this._sideBar.getIsVisible() ? this._sideBar.getWidth() : 0;
 
     this.tabsMap.forEach((tab) => {
       tab.view.setBounds({

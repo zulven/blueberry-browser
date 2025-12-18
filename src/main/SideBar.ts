@@ -8,6 +8,7 @@ export class SideBar {
   private baseWindow: BaseWindow;
   private llmClient: LLMClient;
   private isVisible: boolean = true;
+  private width: number = 400;
 
   constructor(baseWindow: BaseWindow) {
     this.baseWindow = baseWindow;
@@ -51,9 +52,9 @@ export class SideBar {
 
     const bounds = this.baseWindow.getBounds();
     this.webContentsView.setBounds({
-      x: bounds.width - 400, // 400px width sidebar on the right
+      x: bounds.width - this.width,
       y: 88, // Start below the topbar
-      width: 400,
+      width: this.width,
       height: bounds.height - 88, // Subtract topbar height
     });
   }
@@ -78,6 +79,16 @@ export class SideBar {
 
   get client(): LLMClient {
     return this.llmClient;
+  }
+
+  getWidth(): number {
+    return this.width;
+  }
+
+  setWidth(width: number): void {
+    const next = Math.max(260, Math.min(900, Math.round(width)));
+    this.width = next;
+    this.updateBounds();
   }
 
   show(): void {

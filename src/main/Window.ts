@@ -2,6 +2,7 @@ import { BaseWindow, shell } from "electron";
 import { Tab } from "./Tab";
 import { TopBar } from "./TopBar";
 import { SideBar } from "./SideBar";
+import { AgentOverlay } from "./AgentOverlay";
 
 export class Window {
   private _baseWindow: BaseWindow;
@@ -10,6 +11,7 @@ export class Window {
   private tabCounter: number = 0;
   private _topBar: TopBar;
   private _sideBar: SideBar;
+  private _agentOverlay: AgentOverlay | null = null;
 
   constructor() {
     // Create the browser window.
@@ -33,12 +35,16 @@ export class Window {
     // Set the window reference on the LLM client to avoid circular dependency
     this._sideBar.client.setWindow(this);
 
+    this._agentOverlay = new AgentOverlay(this._baseWindow);
+    this.updateOverlayBounds();
+
     // Create the first tab
     this.createTab();
 
     // Set up window resize handler
     this._baseWindow.on("resize", () => {
       this.updateTabBounds();
+      this.updateOverlayBounds();
       this._topBar.updateBounds();
       this._sideBar.updateBounds();
       // Notify renderer of resize through active tab
@@ -51,6 +57,40 @@ export class Window {
       }
     });
 
+    this._baseWindow.on("move", () => {
+      this.updateOverlayBounds();
+    });
+
+    this._baseWindow.on("moved", () => {
+      this.updateOverlayBounds();
+    });
+
+    this._baseWindow.on("show", () => {
+      this.updateOverlayBounds();
+      try {
+        this._agentOverlay?.show();
+      } catch {
+        // ignore
+      }
+    });
+
+    this._baseWindow.on("minimize", () => {
+      try {
+        this._agentOverlay?.hide();
+      } catch {
+        // ignore
+      }
+    });
+
+    this._baseWindow.on("restore", () => {
+      this.updateOverlayBounds();
+      try {
+        this._agentOverlay?.show();
+      } catch {
+        // ignore
+      }
+    });
+
     this.setupEventListeners();
   }
 
@@ -59,6 +99,12 @@ export class Window {
       // Clean up all tabs when window is closed
       this.tabsMap.forEach((tab) => tab.destroy());
       this.tabsMap.clear();
+
+      try {
+        this._agentOverlay?.destroy();
+      } catch {
+        // ignore
+      }
     });
   }
 
@@ -114,6 +160,8 @@ export class Window {
       width: bounds.width - sidebarWidth,
       height: bounds.height - 88, // Subtract topbar height
     });
+
+    this.updateOverlayBounds();
 
     // Store the tab
     this.tabsMap.set(tabId, tab);
@@ -178,6 +226,8 @@ export class Window {
     // Show the new active tab
     tab.show();
     this.activeTabId = tabId;
+
+    this.updateOverlayBounds();
 
     // Update the window title to match the tab title
     this._baseWindow.setTitle(tab.title || "Blueberry Browser");
@@ -255,15 +305,36 @@ export class Window {
     });
   }
 
+  private updateOverlayBounds(): void {
+    const bounds = this._baseWindow.getBounds();
+    const sidebarWidth = this._sideBar.getIsVisible() ? this._sideBar.getWidth() : 0;
+    if (this._agentOverlay) {
+      this._agentOverlay.setBounds({
+        x: 0,
+        y: 88,
+        width: bounds.width - sidebarWidth,
+        height: bounds.height - 88,
+      });
+    }
+  }
+
   // Public method to update all bounds when sidebar is toggled
   updateAllBounds(): void {
     this.updateTabBounds();
     this._sideBar.updateBounds();
+    this.updateOverlayBounds();
   }
 
   // Getter for sidebar to access from main process
   get sidebar(): SideBar {
     return this._sideBar;
+  }
+
+  get agentOverlay(): AgentOverlay {
+    if (!this._agentOverlay) {
+      throw new Error("AgentOverlay not initialized");
+    }
+    return this._agentOverlay;
   }
 
   // Getter for topBar to access from main process

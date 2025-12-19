@@ -44,8 +44,8 @@ const MAX_CONTEXT_LENGTH = 4000;
 const DEFAULT_TEMPERATURE = 0.7;
 
 const GEMINI_COMPUTER_USE_MODEL_PREFIX = "gemini-2.5-computer-use-preview";
-const DEFAULT_COMPUTER_USE_SCREEN_WIDTH = 600;
-const DEFAULT_COMPUTER_USE_SCREEN_HEIGHT = 800;
+const DEFAULT_COMPUTER_USE_SCREEN_WIDTH = 1440;
+const DEFAULT_COMPUTER_USE_SCREEN_HEIGHT = 900;
 
 export class LLMClient {
   private readonly webContents: WebContents;
@@ -55,7 +55,160 @@ export class LLMClient {
   private readonly model: LanguageModel | null;
   private messages: CoreMessage[] = [];
 
+  private activeRunAbortController: AbortController | null = null;
+  private activeRunMessageId: string | null = null;
+
   private geminiComputerUseContents: any[] | null = null;
+
+  private activeGeminiComputerUseRunId: string | null = null;
+  private geminiComputerUseNavigationOverlayBuffer = "";
+
+  private highlightTrackTimer: NodeJS.Timeout | null = null;
+  private highlightTrackUrl: string | null = null;
+
+  private stopHighlightTracking(): void {
+    if (this.highlightTrackTimer) {
+      clearInterval(this.highlightTrackTimer);
+      this.highlightTrackTimer = null;
+    }
+    this.highlightTrackUrl = null;
+  }
+
+  private async clearHighlight(runId: string): Promise<void> {
+    await this.sendOverlayEvent({ type: "highlight-clear", runId });
+  }
+
+  private async startHighlightTracking(tab: any, x: number, y: number): Promise<void> {
+    const runId = this.activeGeminiComputerUseRunId;
+    if (!runId) return;
+
+    // Reset any existing tracker
+    this.stopHighlightTracking();
+    this.highlightTrackUrl = typeof tab?.url === "string" ? tab.url : null;
+
+    const emitOnce = async (): Promise<boolean> => {
+      const rect = await this.getHighlightRectAt(tab, x, y);
+      if (rect) {
+        await this.sendOverlayEvent({ type: "highlight", runId, rect });
+        return true;
+      }
+      await this.sendOverlayEvent({ type: "highlight-point", runId, x, y });
+      return false;
+    };
+
+    try {
+      await emitOnce();
+    } catch {
+      // ignore
+    }
+
+    this.highlightTrackTimer = setInterval(() => {
+      // fire-and-forget (we handle errors)
+      (async () => {
+        if (this.activeGeminiComputerUseRunId !== runId) {
+          this.stopHighlightTracking();
+          return;
+        }
+
+        const currentUrl = typeof tab?.url === "string" ? tab.url : null;
+        if (this.highlightTrackUrl && currentUrl && currentUrl !== this.highlightTrackUrl) {
+          await this.clearHighlight(runId);
+          this.stopHighlightTracking();
+          return;
+        }
+
+        const rect = await this.getHighlightRectAt(tab, x, y);
+        if (!rect) {
+          await this.clearHighlight(runId);
+          this.stopHighlightTracking();
+          return;
+        }
+
+        await this.sendOverlayEvent({ type: "highlight", runId, rect });
+      })().catch(() => undefined);
+    }, 250);
+  }
+
+  private async sendOverlayEvent(event: any): Promise<void> {
+    if (!this.window) return;
+    try {
+      await this.window.agentOverlay.sendEvent(event);
+    } catch {
+      // ignore
+    }
+  }
+
+  private async getHighlightRectAt(tab: any, x: number, y: number): Promise<
+    | { x: number; y: number; width: number; height: number }
+    | null
+  > {
+    const js = `(() => {
+      try {
+        const x = ${x};
+        const y = ${y};
+        const stack = typeof document.elementsFromPoint === 'function'
+          ? document.elementsFromPoint(x, y)
+          : [];
+        const candidates = (stack && stack.length ? stack : [document.elementFromPoint(x, y)]).filter(Boolean);
+
+        const isInteractive = (el) => {
+          if (!el || !(el instanceof Element)) return false;
+          const tag = el.tagName ? el.tagName.toLowerCase() : '';
+          if (tag === 'button' || tag === 'a' || tag === 'input' || tag === 'textarea' || tag === 'select' || tag === 'summary' || tag === 'label') return true;
+          const role = el.getAttribute('role');
+          if (role === 'button' || role === 'link' || role === 'textbox') return true;
+          if (el.isContentEditable) return true;
+          if (typeof el.onclick === 'function') return true;
+          const cs = window.getComputedStyle(el);
+          if (cs && cs.cursor === 'pointer') return true;
+          return false;
+        };
+
+        let base = null;
+        for (const el of candidates) {
+          if (el && el instanceof Element) { base = el; break; }
+        }
+        if (!base) return null;
+
+        let target = base;
+        let cur = base;
+        for (let i = 0; i < 7 && cur; i++) {
+          if (isInteractive(cur)) { target = cur; break; }
+          cur = cur.parentElement;
+        }
+
+        // Try to find a sensible rect.
+        let rectEl = target;
+        for (let i = 0; i < 5 && rectEl; i++) {
+          const r = rectEl.getBoundingClientRect();
+          if (r && Number.isFinite(r.x) && Number.isFinite(r.y) && r.width > 2 && r.height > 2) {
+            return { x: r.x, y: r.y, width: r.width, height: r.height };
+          }
+          rectEl = rectEl.parentElement;
+        }
+
+        return null;
+      } catch {
+        return null;
+      }
+    })();`;
+
+    try {
+      const res = await tab.runJs(js);
+      if (
+        res &&
+        typeof res.x === "number" &&
+        typeof res.y === "number" &&
+        typeof res.width === "number" &&
+        typeof res.height === "number"
+      ) {
+        return res;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
 
   private readonly debugStream: boolean =
     process.env.AI_SDK_DEBUG_STREAM === "true" ||
@@ -275,6 +428,11 @@ export class LLMClient {
 
   async sendChatMessage(request: ChatRequest): Promise<void> {
     try {
+      // Abort any in-flight run before starting a new one.
+      this.abortActiveRun();
+      this.activeRunAbortController = new AbortController();
+      this.activeRunMessageId = request.messageId;
+
       // Get screenshot from active tab if available
       let screenshot: string | null = null;
       if (this.window) {
@@ -326,11 +484,85 @@ export class LLMClient {
       }
 
       const messages = await this.prepareMessagesWithContext(request);
-      await this.streamResponse(messages, request.messageId);
+      await this.streamResponse(messages, request.messageId, this.activeRunAbortController.signal);
     } catch (error) {
+      if (this.isAbortError(error)) {
+        // User-initiated cancellation; do not surface as an error.
+        return;
+      }
       console.error("Error in LLM request:", error);
       this.handleStreamError(error, request.messageId);
+    } finally {
+      // Only clear if we are still the active run.
+      if (this.activeRunMessageId === request.messageId) {
+        this.activeRunAbortController = null;
+        this.activeRunMessageId = null;
+      }
     }
+  }
+
+  abortActiveRun(): void {
+    const controller = this.activeRunAbortController;
+    const messageId = this.activeRunMessageId;
+
+    if (!controller || controller.signal.aborted) return;
+
+    try {
+      controller.abort();
+    } catch {
+      // ignore
+    }
+
+    if (messageId) {
+      // Mark streams complete so UI exits loading state.
+      this.sendReasoningChunk(messageId, { content: "", isComplete: true });
+      this.sendNavigationChunk(messageId, { content: "", isComplete: true });
+      this.sendStreamChunk(messageId, { content: "", isComplete: true });
+    }
+
+    // If we abort a Gemini Computer Use run mid-step, the model response containing
+    // functionCall parts may have been persisted without a corresponding functionResponse.
+    // Prune trailing functionCall turns to prevent follow-up INVALID_ARGUMENT errors.
+    if (Array.isArray(this.geminiComputerUseContents)) {
+      this.geminiComputerUseContents = this.pruneDanglingGeminiFunctionCalls(this.geminiComputerUseContents);
+    }
+  }
+
+  private isAbortError(error: unknown): boolean {
+    if (!error) return false;
+    if (error instanceof Error) {
+      const msg = error.message.toLowerCase();
+      return msg === "aborted" || msg.includes("abort") || msg.includes("aborted");
+    }
+    const str = String(error).toLowerCase();
+    return str.includes("abort") || str.includes("aborted");
+  }
+
+  private pruneDanglingGeminiFunctionCalls(contents: any[]): any[] {
+    if (!Array.isArray(contents)) return [];
+    const out = contents.slice();
+
+    const hasFunctionCall = (content: any): boolean => {
+      const parts = content && typeof content === "object" ? (content as any).parts : null;
+      if (!Array.isArray(parts)) return false;
+      return parts.some((p: any) => {
+        if (!p || typeof p !== "object") return false;
+        return Boolean((p as any).functionCall || (p as any).function_call);
+      });
+    };
+
+    // Remove any trailing model turns containing function calls.
+    while (out.length > 0) {
+      const last = out[out.length - 1];
+      const role = last && typeof last === "object" ? (last as any).role : null;
+      if (role === "model" && hasFunctionCall(last)) {
+        out.pop();
+        continue;
+      }
+      break;
+    }
+
+    return out;
   }
 
   clearMessages(): void {
@@ -423,35 +655,90 @@ export class LLMClient {
     return tab;
   }
 
+  private isValidPngBase64(data: string): boolean {
+    if (typeof data !== "string" || data.length < 64) return false;
+    let buf: Buffer;
+    try {
+      buf = Buffer.from(data, "base64");
+    } catch {
+      return false;
+    }
+
+    // PNG signature: 89 50 4E 47 0D 0A 1A 0A
+    if (buf.length < 16) return false;
+    const sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    for (let i = 0; i < sig.length; i++) {
+      if (buf[i] !== sig[i]) return false;
+    }
+
+    // Avoid tiny/empty frames.
+    if (buf.length < 1024) return false;
+
+    return true;
+  }
+
+  private isGeminiInputImageError(error: unknown): boolean {
+    const msg =
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : JSON.stringify(error ?? "");
+    return msg.toLowerCase().includes("unable to process input image");
+  }
+
   private async captureActiveTabPngBase64(): Promise<{ data: string; width: number; height: number }> {
-    const tab = await this.getActiveTabOrThrow();
-    const image = await tab.screenshot();
-    const size = image.getSize();
-    const width = typeof size?.width === "number" ? size.width : DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
-    const height = typeof size?.height === "number" ? size.height : DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
+    const maxAttempts = 3;
+    let lastError: unknown = null;
 
-    const maxW = DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
-    const maxH = DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
-    const scale = Math.min(1, maxW / Math.max(1, width), maxH / Math.max(1, height));
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const tab = await this.getActiveTabOrThrow();
+        const image = await tab.screenshot();
+        const size = image.getSize();
+        const width = typeof size?.width === "number" ? size.width : DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
+        const height = typeof size?.height === "number" ? size.height : DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
 
-    const capped =
-      scale < 1
-        ? image.resize({
-            width: Math.max(1, Math.round(width * scale)),
-            height: Math.max(1, Math.round(height * scale)),
-            quality: "best",
-          })
-        : image;
+        const maxW = DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
+        const maxH = DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
+        const scale = Math.min(1, maxW / Math.max(1, width), maxH / Math.max(1, height));
 
-    const cappedSize = capped.getSize();
-    const cappedWidth =
-      typeof cappedSize?.width === "number" ? cappedSize.width : Math.min(width, maxW);
-    const cappedHeight =
-      typeof cappedSize?.height === "number" ? cappedSize.height : Math.min(height, maxH);
+        const capped =
+          scale < 1
+            ? image.resize({
+                width: Math.max(1, Math.round(width * scale)),
+                height: Math.max(1, Math.round(height * scale)),
+                quality: "best",
+              })
+            : image;
 
-    const png = capped.toPNG();
-    const data = png.toString("base64");
-    return { data, width: cappedWidth, height: cappedHeight };
+        const cappedSize = capped.getSize();
+        const cappedWidth =
+          typeof cappedSize?.width === "number" ? cappedSize.width : Math.min(width, maxW);
+        const cappedHeight =
+          typeof cappedSize?.height === "number" ? cappedSize.height : Math.min(height, maxH);
+
+        const png = capped.toPNG();
+        const data = png.toString("base64");
+
+        if (!this.isValidPngBase64(data)) {
+          throw new Error("Invalid screenshot PNG data");
+        }
+
+        return { data, width: cappedWidth, height: cappedHeight };
+      } catch (e) {
+        lastError = e;
+        // Small backoff to allow the page/frame to settle (esp. after navigation).
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 150 * attempt));
+        }
+      }
+    }
+
+    const extra = lastError instanceof Error ? lastError.message : String(lastError ?? "");
+    throw new Error(
+      `Unable to capture a valid page screenshot. Please try again. (${extra || "unknown error"})`
+    );
   }
 
   private async executeComputerUseAction(action: {
@@ -475,9 +762,35 @@ export class LLMClient {
     const h = typeof screen?.h === "number" ? screen.h : DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
 
     const x = this.denormalizeCoord(args.x, w);
-    const y = this.denormalizeCoord(args.y, h);
+    let y = this.denormalizeCoord(args.y, h);
     const destX = this.denormalizeCoord(args.destination_x, w);
-    const destY = this.denormalizeCoord(args.destination_y, h);
+    let destY = this.denormalizeCoord(args.destination_y, h);
+
+    const ensureSafeBottomMargin = async (inputY: number): Promise<{ y: number; scrolledBy: number }> => {
+      const safeBottomPx = 160;
+      const threshold = h - safeBottomPx;
+      if (!Number.isFinite(inputY) || inputY <= threshold) return { y: inputY, scrolledBy: 0 };
+
+      const desired = Math.max(0, Math.round(inputY - threshold));
+      if (desired <= 0) return { y: inputY, scrolledBy: 0 };
+
+      const scrolledBy = await tab.runJs(
+        `(() => {
+          const before = window.scrollY || 0;
+          try {
+            window.scrollBy({ top: ${desired}, left: 0, behavior: 'instant' });
+          } catch {
+            window.scrollBy(0, ${desired});
+          }
+          const after = window.scrollY || 0;
+          return after - before;
+        })()`
+      );
+
+      const actual = typeof scrolledBy === "number" ? scrolledBy : Number(scrolledBy);
+      const applied = Number.isFinite(actual) ? actual : 0;
+      return { y: Math.max(0, inputY - applied), scrolledBy: applied };
+    };
 
     const sendKey = (keyCode: string, modifiers?: Array<"shift" | "control" | "alt" | "meta">) => {
       tab.webContents.sendInputEvent({ type: "keyDown", keyCode, modifiers });
@@ -534,7 +847,20 @@ export class LLMClient {
         }
         case "click_at":
         case "hover_at": {
+          const adjusted = await ensureSafeBottomMargin(y);
+          y = adjusted.y;
+
           if (action.name === "hover_at") {
+            if (this.activeGeminiComputerUseRunId) {
+              await this.sendOverlayEvent({
+                type: "pointer",
+                runId: this.activeGeminiComputerUseRunId,
+                mode: "pointer",
+                x,
+                y,
+              });
+              await this.startHighlightTracking(tab, x, y);
+            }
             tab.webContents.sendInputEvent({ type: "mouseMove", x, y });
             return { name: action.name, response: { ok: true, x, y, type: "mousemove", url: tab.url } };
           }
@@ -542,6 +868,16 @@ export class LLMClient {
           tab.webContents.sendInputEvent({ type: "mouseMove", x, y });
           tab.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
           tab.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
+          if (this.activeGeminiComputerUseRunId) {
+            await this.sendOverlayEvent({
+              type: "pointer",
+              runId: this.activeGeminiComputerUseRunId,
+              mode: "pointer",
+              x,
+              y,
+            });
+            await this.startHighlightTracking(tab, x, y);
+          }
           return { name: action.name, response: { ok: true, x, y, type: "click", url: tab.url } };
         }
 
@@ -550,6 +886,20 @@ export class LLMClient {
           const pressEnter = Boolean(args.press_enter);
           const clearBefore =
             typeof args.clear_before_typing === "boolean" ? args.clear_before_typing : false;
+
+          const adjusted = await ensureSafeBottomMargin(y);
+          y = adjusted.y;
+
+          if (this.activeGeminiComputerUseRunId) {
+            await this.sendOverlayEvent({
+              type: "pointer",
+              runId: this.activeGeminiComputerUseRunId,
+              mode: "text",
+              x,
+              y,
+            });
+            await this.startHighlightTracking(tab, x, y);
+          }
 
           // Focus the element by clicking, then type using real input events.
           tab.webContents.sendInputEvent({ type: "mouseMove", x, y });
@@ -691,10 +1041,26 @@ export class LLMClient {
         }
 
         case "drag_and_drop": {
+          const adjustedFrom = await ensureSafeBottomMargin(y);
+          y = adjustedFrom.y;
+          const adjustedTo = await ensureSafeBottomMargin(destY);
+          destY = adjustedTo.y;
+
           tab.webContents.sendInputEvent({ type: "mouseMove", x, y });
           tab.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
           tab.webContents.sendInputEvent({ type: "mouseMove", x: destX, y: destY });
           tab.webContents.sendInputEvent({ type: "mouseUp", x: destX, y: destY, button: "left", clickCount: 1 });
+
+          if (this.activeGeminiComputerUseRunId) {
+            await this.sendOverlayEvent({
+              type: "pointer",
+              runId: this.activeGeminiComputerUseRunId,
+              mode: "pointer",
+              x: destX,
+              y: destY,
+            });
+            await this.startHighlightTracking(tab, destX, destY);
+          }
           return {
             name: action.name,
             response: { ok: true, x, y, destination_x: destX, destination_y: destY, url: tab.url },
@@ -714,6 +1080,7 @@ export class LLMClient {
     messageId: string;
     userPrompt: string;
     systemInstruction: string;
+    abortSignal?: AbortSignal;
   }): Promise<void> {
     const apiKey = this.getApiKey();
     if (!apiKey) {
@@ -726,6 +1093,14 @@ export class LLMClient {
       : 15;
 
     let messageIndex: number | null = null;
+    let resetAssistantOnNextDelta = false;
+    let sentAnyNavigationDelta = false;
+    let overlayStarted = false;
+    let overlayStartPromise: Promise<void> | null = null;
+
+    if (params.abortSignal?.aborted) {
+      return;
+    }
 
     const ensureAssistantMessage = (): number => {
       if (messageIndex !== null) return messageIndex;
@@ -740,6 +1115,9 @@ export class LLMClient {
     if (!Array.isArray(this.geminiComputerUseContents)) {
       this.geminiComputerUseContents = [];
     }
+
+    this.geminiComputerUseContents = this.normalizeGeminiContents(this.geminiComputerUseContents);
+    this.geminiComputerUseContents = this.sanitizeGeminiComputerUseContents(this.geminiComputerUseContents);
 
     // Append the new user turn (text + current screenshot) to the persistent CU history.
     const userShot = await this.captureActiveTabPngBase64();
@@ -756,67 +1134,141 @@ export class LLMClient {
       ],
     });
 
-    await agent.run({
-      model: this.modelName,
-      userPrompt: params.userPrompt,
-      systemInstruction: params.systemInstruction,
-      maxSteps,
-      excludedPredefinedFunctions: ["open_web_browser"],
-      existingContents: this.geminiComputerUseContents,
-      skipInitialUserTurn: true,
-      callbacks: {
-        captureScreenshot: async () => await this.captureActiveTabPngBase64(),
-        executeAction: async (action) => {
-          const tab = await this.getActiveTabOrThrow();
-          const currentUrl = tab.url;
-          const executed = await this.executeComputerUseAction(action);
-          return {
-            name: executed.name,
-            response: {
-              url: currentUrl,
-              ...(executed.response ?? {}),
-            },
-          };
-        },
-        onAssistantDelta: (delta) => {
-          if (!delta) return;
-          const idx = ensureAssistantMessage();
-          const current =
-            typeof this.messages[idx]?.content === "string"
-              ? (this.messages[idx].content as string)
-              : "";
-          this.messages[idx] = { role: "assistant", content: current + delta };
-          this.sendMessagesToRenderer();
-          this.sendStreamChunk(params.messageId, { content: delta, isComplete: false });
-        },
-        onReasoningDelta: (delta) => {
-          if (!delta) return;
-          this.sendReasoningChunk(params.messageId, { content: delta, isComplete: false });
-        },
-        onNavigationDelta: (delta) => {
-          if (!delta) return;
-          this.sendNavigationChunk(params.messageId, { content: delta, isComplete: false });
-        },
-        onLog: this.debugStream
-          ? (event) => {
-              try {
-                console.log("[GEMINI_CU]", event);
-              } catch {
-                // ignore
-              }
+    this.activeGeminiComputerUseRunId = params.messageId;
+    this.geminiComputerUseNavigationOverlayBuffer = "";
+
+    const ensureOverlayStarted = (): Promise<void> => {
+      if (overlayStarted) return overlayStartPromise ?? Promise.resolve();
+      overlayStarted = true;
+      overlayStartPromise = this.sendOverlayEvent({ type: "start", runId: params.messageId }).catch(
+        () => undefined
+      );
+      return overlayStartPromise;
+    };
+
+    try {
+      await agent.run({
+        model: this.modelName,
+        userPrompt: params.userPrompt,
+        systemInstruction: params.systemInstruction,
+        maxSteps,
+        excludedPredefinedFunctions: ["open_web_browser"],
+        existingContents: this.geminiComputerUseContents,
+        skipInitialUserTurn: true,
+        abortSignal: params.abortSignal,
+        callbacks: {
+          captureScreenshot: async () => await this.captureActiveTabPngBase64(),
+          executeAction: async (action) => {
+            if (params.abortSignal?.aborted) {
+              throw new Error("aborted");
             }
-          : undefined,
-      },
-    });
+            resetAssistantOnNextDelta = true;
+
+            // Start the overlay as soon as we know the run is truly using tools.
+            // (If we wait until later, early overlay log events can be dropped.)
+            await ensureOverlayStarted();
+
+            const tab = await this.getActiveTabOrThrow();
+            const currentUrl = tab.url;
+            const executed = await this.executeComputerUseAction(action);
+            if (params.abortSignal?.aborted) {
+              throw new Error("aborted");
+            }
+            return {
+              name: executed.name,
+              response: {
+                url: currentUrl,
+                ...(executed.response ?? {}),
+              },
+            };
+          },
+          onAssistantDelta: (delta) => {
+            if (params.abortSignal?.aborted) return;
+            if (!delta) return;
+            const idx = ensureAssistantMessage();
+            const current =
+              typeof this.messages[idx]?.content === "string"
+                ? (this.messages[idx].content as string)
+                : "";
+
+            if (resetAssistantOnNextDelta) {
+              resetAssistantOnNextDelta = false;
+              this.messages[idx] = { role: "assistant", content: delta };
+            } else {
+              this.messages[idx] = { role: "assistant", content: current + delta };
+            }
+            this.sendMessagesToRenderer();
+            this.sendStreamChunk(params.messageId, { content: delta, isComplete: false });
+          },
+          onReasoningDelta: (delta) => {
+            if (params.abortSignal?.aborted) return;
+            if (!delta) return;
+            this.sendReasoningChunk(params.messageId, { content: delta, isComplete: false });
+          },
+          onNavigationDelta: (delta) => {
+            if (params.abortSignal?.aborted) return;
+            if (!delta) return;
+            sentAnyNavigationDelta = true;
+            this.sendNavigationChunk(params.messageId, { content: delta, isComplete: false });
+            if (this.activeGeminiComputerUseRunId) {
+              // Start overlay on the first navigation delta (which only happens after first tool call)
+              // so log events don't get ignored due to missing runId.
+              ensureOverlayStarted()
+                .then(() => {
+                  const pretty = this.formatComputerUseNavigationForOverlay(delta);
+                  for (const line of pretty) {
+                    this.sendOverlayEvent({ type: "log", runId: params.messageId, text: line }).catch(
+                      () => undefined
+                    );
+                  }
+                })
+                .catch(() => undefined);
+            }
+          },
+          onLog: this.debugStream
+            ? (event) => {
+                try {
+                  console.log("[GEMINI_CU]", event);
+                } catch {
+                  // ignore
+                }
+              }
+            : undefined,
+        },
+      });
+    } catch (e) {
+      // Treat abort as a normal cancel. Also prune any dangling functionCall turns.
+      if (params.abortSignal?.aborted || this.isAbortError(e)) {
+        if (Array.isArray(this.geminiComputerUseContents)) {
+          this.geminiComputerUseContents = this.pruneDanglingGeminiFunctionCalls(this.geminiComputerUseContents);
+        }
+        return;
+      }
+      throw e;
+    } finally {
+      try {
+        if (this.activeGeminiComputerUseRunId && overlayStarted) {
+          await this.clearHighlight(params.messageId);
+          this.stopHighlightTracking();
+          await this.sendOverlayEvent({ type: "end", runId: params.messageId });
+        }
+      } catch {
+        // ignore
+      }
+      this.activeGeminiComputerUseRunId = null;
+    }
 
     this.sendReasoningChunk(params.messageId, { content: "", isComplete: true });
-    this.sendNavigationChunk(params.messageId, { content: "", isComplete: true });
+    if (sentAnyNavigationDelta) {
+      this.sendNavigationChunk(params.messageId, { content: "", isComplete: true });
+    }
     this.sendStreamChunk(params.messageId, { content: "", isComplete: true });
   }
 
   private async streamResponse(
     messages: CoreMessage[],
-    messageId: string
+    messageId: string,
+    abortSignal?: AbortSignal
   ): Promise<void> {
     if (this.isGeminiComputerUseModel()) {
       const userMessage = messages
@@ -847,6 +1299,7 @@ export class LLMClient {
         messageId,
         userPrompt: userPrompt || "",
         systemInstruction,
+        abortSignal,
       });
       return;
     }
@@ -925,7 +1378,7 @@ export class LLMClient {
           ...(temperatureEnabled ? { temperature: DEFAULT_TEMPERATURE } : {}),
           ...(providerOptions ? { providerOptions } : {}),
           maxRetries: 3,
-          abortSignal: undefined, // Could add abort controller for cancellation
+          abortSignal,
         });
 
         await this.processFullStream(result.fullStream, messageId, {
@@ -940,6 +1393,9 @@ export class LLMClient {
       try {
         await run({ includeProviderReasoningSummary: requestReasoningSummary });
       } catch (error) {
+        if (abortSignal?.aborted) {
+          return;
+        }
         const errorMessage =
           error instanceof Error ? error.message : String(error ?? "");
 
@@ -1282,6 +1738,11 @@ export class LLMClient {
   private handleStreamError(error: unknown, messageId: string): void {
     console.error("Error streaming from LLM:", error);
 
+    // If Gemini rejects an image input, clear CU history so we don't get stuck in a loop.
+    if (this.isGeminiInputImageError(error)) {
+      this.geminiComputerUseContents = [];
+    }
+
     const errorMessage = this.getErrorMessage(error);
     this.sendErrorMessage(messageId, errorMessage);
   }
@@ -1292,6 +1753,10 @@ export class LLMClient {
     }
 
     const message = error.message.toLowerCase();
+
+    if (message.includes("unable to process input image")) {
+      return "I couldn't process the page screenshot. Please try again (or refresh the page) and retry.";
+    }
 
     if (message.includes("401") || message.includes("unauthorized")) {
       return "Authentication error: Please check your API key in the .env file.";
@@ -1350,5 +1815,175 @@ export class LLMClient {
       content: chunk.content ?? "",
       isComplete: chunk.isComplete,
     });
+  }
+
+  private normalizeGeminiContents(input: any[]): any[] {
+    const out: any[] = [];
+
+    for (const item of input) {
+      if (!item || typeof item !== "object") continue;
+
+      const roleRaw = (item as any).role;
+      const role = typeof roleRaw === "string" ? roleRaw : "user";
+
+      if (Array.isArray((item as any).parts)) {
+        out.push({ role, parts: (item as any).parts });
+        continue;
+      }
+
+      // Convert legacy { role, content } shape into { role, parts }
+      const content = (item as any).content;
+      if (typeof content === "string" && content.length > 0) {
+        out.push({ role, parts: [{ text: content }] });
+        continue;
+      }
+
+      // Convert legacy CoreMessage-like { role, content: [{type:'text',text}, ...] }
+      if (Array.isArray(content)) {
+        const parts: any[] = [];
+        for (const c of content) {
+          if (!c || typeof c !== "object") continue;
+          if ((c as any).type === "text" && typeof (c as any).text === "string") {
+            parts.push({ text: (c as any).text });
+          }
+        }
+        if (parts.length > 0) {
+          out.push({ role, parts });
+        }
+      }
+    }
+
+    return out;
+  }
+
+  private sanitizeGeminiComputerUseContents(contents: any[]): any[] {
+    try {
+      this.assertValidGeminiComputerUseContents(contents);
+      return contents;
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e ?? "");
+      console.error("[GEMINI_CU] Invalid contents history; resetting.", message);
+      return [];
+    }
+  }
+
+  private assertValidGeminiComputerUseContents(contents: any[]): void {
+    if (!Array.isArray(contents)) {
+      throw new Error("Gemini contents must be an array");
+    }
+
+    for (const [idx, item] of contents.entries()) {
+      if (!item || typeof item !== "object") {
+        throw new Error(`Invalid content at index ${idx}: not an object`);
+      }
+
+      const role = (item as any).role;
+      if (typeof role !== "string") {
+        throw new Error(`Invalid content at index ${idx}: missing role`);
+      }
+
+      const parts = (item as any).parts;
+      if (!Array.isArray(parts)) {
+        throw new Error(`Invalid content at index ${idx}: missing parts[]`);
+      }
+
+      // Invariant: for computer-use runs, user turns are either:
+      //  - prompt turn: (text part(s)) + optional screenshot
+      //  - tool-result turn: (functionResponse part(s)) + optional screenshot
+      // but never both in the same Content.
+      if (role === "user") {
+        let textParts = 0;
+        let functionResponseParts = 0;
+
+        for (const p of parts) {
+          if (!p || typeof p !== "object") continue;
+
+          if (typeof (p as any).text === "string" && (p as any).text.length > 0) {
+            textParts += 1;
+          }
+
+          if (typeof (p as any).functionResponse === "object" && (p as any).functionResponse) {
+            functionResponseParts += 1;
+          }
+        }
+
+        if (textParts > 0 && functionResponseParts > 0) {
+          throw new Error(
+            `Invalid user content at index ${idx}: contains both text and functionResponse parts`
+          );
+        }
+      }
+    }
+  }
+
+  private formatComputerUseNavigationForOverlay(delta: string): string[] {
+    this.geminiComputerUseNavigationOverlayBuffer += delta;
+    const parts = this.geminiComputerUseNavigationOverlayBuffer.split(/\r?\n/);
+    const completeLines = parts.slice(0, -1);
+    this.geminiComputerUseNavigationOverlayBuffer = parts[parts.length - 1] ?? "";
+
+    const prettyLines: string[] = [];
+
+    for (const rawLine of completeLines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      const cleaned = line.replace(/^Computer Use\s*:\s*/i, "").trim();
+
+      const stepMatch = cleaned.match(/\bstep\s+(\d+)\s*\/\s*(\d+)\b/i);
+      if (stepMatch) {
+        continue;
+      }
+
+      if (/\bdone\b/i.test(cleaned) && /no more actions/i.test(cleaned)) {
+        prettyLines.push("Navigation complete");
+        continue;
+      }
+
+      const jsonStart = cleaned.indexOf("{");
+      const actionPart = (jsonStart >= 0 ? cleaned.slice(0, jsonStart) : cleaned).trim();
+      const jsonPart = jsonStart >= 0 ? cleaned.slice(jsonStart).trim() : "";
+
+      let parsedArgs: any = null;
+      if (jsonPart) {
+        try {
+          parsedArgs = JSON.parse(jsonPart);
+        } catch {
+          parsedArgs = null;
+        }
+      }
+
+      const lowerAction = actionPart.toLowerCase();
+
+      let pretty = "";
+      if (lowerAction.includes("type_text")) {
+        const text = parsedArgs && typeof parsedArgs.text === "string" ? parsedArgs.text : "";
+        const enter = parsedArgs && typeof parsedArgs.enter === "boolean" ? parsedArgs.enter : false;
+        const safeText = text.length > 0 ? ` “${text}”` : "";
+        pretty = enter ? `Submitting${safeText}` : `Typing${safeText}`;
+      } else if (lowerAction.includes("search")) {
+        pretty = "Searching";
+      } else if (lowerAction.includes("click")) {
+        pretty = "Clicking element";
+      } else if (lowerAction.includes("scroll")) {
+        pretty = "Scrolling";
+      } else if (
+        lowerAction.includes("navigate") ||
+        lowerAction.includes("open_url") ||
+        lowerAction.includes("openurl")
+      ) {
+        pretty = "Opening page";
+      } else if (lowerAction.includes("wait")) {
+        pretty = "Waiting";
+      } else if (lowerAction.includes("key") || lowerAction.includes("keypress")) {
+        pretty = "Pressing keys";
+      } else {
+        pretty = "Continuing";
+      }
+
+      prettyLines.push(pretty);
+    }
+
+    return prettyLines;
   }
 }

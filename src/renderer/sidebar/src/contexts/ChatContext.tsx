@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react'
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react'
 
 interface Message {
     id: string
@@ -18,8 +18,13 @@ interface ChatContextType {
     navigation: string
     isNavigationComplete: boolean
 
+    navigationStepCurrent: number | null
+    navigationStepTotal: number | null
+    navigationStepsCompleted: number
+
     // Chat actions
     sendMessage: (content: string) => Promise<void>
+    abortChat: () => Promise<void>
     clearChat: () => void
 
     // Page content access
@@ -48,6 +53,12 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const [navigation, setNavigation] = useState('')
     const [isNavigationComplete, setIsNavigationComplete] = useState(true)
 
+    const [navigationStepCurrent, setNavigationStepCurrent] = useState<number | null>(null)
+    const [navigationStepTotal, setNavigationStepTotal] = useState<number | null>(null)
+    const [navigationStepsCompleted, setNavigationStepsCompleted] = useState(0)
+
+    const navigationLineBufferRef = useRef('')
+
     // Load initial messages from main process
     useEffect(() => {
         const loadMessages = async () => {
@@ -73,6 +84,18 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         loadMessages()
     }, [])
 
+    const abortChat = useCallback(async () => {
+        try {
+            await window.sidebarAPI.abortChat()
+        } catch (error) {
+            console.error('Failed to abort chat:', error)
+        } finally {
+            setIsLoading(false)
+            setIsReasoningComplete(true)
+            setIsNavigationComplete(true)
+        }
+    }, [])
+
     const sendMessage = useCallback(async (content: string) => {
         setIsLoading(true)
         setReasoning('')
@@ -80,6 +103,11 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         setNavigation('')
         setIsNavigationComplete(false)
+
+        setNavigationStepCurrent(null)
+        setNavigationStepTotal(null)
+        setNavigationStepsCompleted(0)
+        navigationLineBufferRef.current = ''
 
         try {
             const messageId = Date.now().toString()
@@ -105,6 +133,11 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
             setIsReasoningComplete(true)
             setNavigation('')
             setIsNavigationComplete(true)
+
+            setNavigationStepCurrent(null)
+            setNavigationStepTotal(null)
+            setNavigationStepsCompleted(0)
+            navigationLineBufferRef.current = ''
         } catch (error) {
             console.error('Failed to clear chat:', error)
         }
@@ -139,13 +172,15 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // Set up message listeners
     useEffect(() => {
+        // In dev (hot reload / React strict effects), this file can be re-evaluated and
+        // listeners can accumulate. Clear any existing listeners before registering.
+        window.sidebarAPI.removeChatResponseListener()
+        window.sidebarAPI.removeChatReasoningListener()
+        window.sidebarAPI.removeChatNavigationListener()
+        window.sidebarAPI.removeMessagesUpdatedListener()
+
         // Listen for streaming response updates
         const handleChatResponse = (data: { messageId: string; content: string; isComplete: boolean }) => {
-            if (data.content && data.content.length > 0) {
-                setIsLoading(false)
-                return
-            }
-
             if (data.isComplete) {
                 setIsLoading(false)
             }
@@ -153,7 +188,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         const handleChatReasoning = (data: { messageId: string; content: string; isComplete: boolean }) => {
             if (data.content) {
-                setIsLoading(false)
                 setReasoning((prev) => prev + data.content)
             }
             if (data.isComplete) {
@@ -163,11 +197,92 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         const handleChatNavigation = (data: { messageId: string; content: string; isComplete: boolean }) => {
             if (data.content) {
-                setIsLoading(false)
-                setNavigation((prev) => prev + data.content)
+                navigationLineBufferRef.current += data.content
+                const parts = navigationLineBufferRef.current.split(/\r?\n/)
+                const completeLines = parts.slice(0, -1)
+                navigationLineBufferRef.current = parts[parts.length - 1] ?? ''
+
+                const prettyLines: string[] = []
+
+                for (const rawLine of completeLines) {
+                    const line = rawLine.trim()
+                    if (!line) continue
+
+                    const cleaned = line.replace(/^Computer Use\s*:\s*/i, '').trim()
+
+                    const stepMatch = cleaned.match(/\bstep\s+(\d+)\s*\/\s*(\d+)\b/i)
+                    if (stepMatch) {
+                        const cur = Number(stepMatch[1])
+                        const total = Number(stepMatch[2])
+                        if (Number.isFinite(cur)) setNavigationStepCurrent(cur)
+                        if (Number.isFinite(total)) setNavigationStepTotal(total)
+                        continue
+                    }
+
+                    if (/\bdone\b/i.test(cleaned) && /no more actions/i.test(cleaned)) {
+                        continue
+                    }
+
+                    const jsonStart = cleaned.indexOf('{')
+                    const actionPart = (jsonStart >= 0 ? cleaned.slice(0, jsonStart) : cleaned).trim()
+                    const jsonPart = jsonStart >= 0 ? cleaned.slice(jsonStart).trim() : ''
+
+                    let parsedArgs: any = null
+                    if (jsonPart) {
+                        try {
+                            parsedArgs = JSON.parse(jsonPart)
+                        } catch {
+                            parsedArgs = null
+                        }
+                    }
+
+                    const lowerAction = actionPart.toLowerCase()
+
+                    let pretty = ''
+                    if (lowerAction.includes('type_text')) {
+                        const text = parsedArgs && typeof parsedArgs.text === 'string' ? parsedArgs.text : ''
+                        const enter = parsedArgs && typeof parsedArgs.enter === 'boolean' ? parsedArgs.enter : false
+                        const safeText = text.length > 0 ? ` “${text}”` : ''
+                        pretty = enter ? `Submitting${safeText}` : `Typing${safeText}`
+                    } else if (lowerAction.includes('search')) {
+                        pretty = 'Searching'
+                    } else if (lowerAction.includes('click')) {
+                        pretty = 'Clicking element'
+                    } else if (lowerAction.includes('scroll')) {
+                        pretty = 'Scrolling'
+                    } else if (
+                        lowerAction.includes('navigate') ||
+                        lowerAction.includes('open_url') ||
+                        lowerAction.includes('openurl')
+                    ) {
+                        pretty = 'Opening page'
+                    } else if (lowerAction.includes('wait')) {
+                        pretty = 'Waiting'
+                    } else if (lowerAction.includes('key') || lowerAction.includes('keypress')) {
+                        pretty = 'Pressing keys'
+                    } else {
+                        pretty = 'Continuing'
+                    }
+
+                    prettyLines.push(pretty)
+                }
+
+                if (prettyLines.length > 0) {
+                    setNavigation((prevNav) => {
+                        const prefix = prevNav ? '\n' : ''
+                        return prevNav + prefix + prettyLines.join('\n')
+                    })
+                    setNavigationStepsCompleted((prevCount) => prevCount + prettyLines.length)
+                }
             }
+
             if (data.isComplete) {
                 setIsNavigationComplete(true)
+                setNavigation((prev) => {
+                    if (!prev || prev.trim().length === 0) return prev
+                    if (prev.trim().endsWith('Navigation complete')) return prev
+                    return prev + (prev ? '\n\n' : '') + 'Navigation complete'
+                })
             }
         }
 
@@ -208,7 +323,13 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         navigation,
         isNavigationComplete,
+
+        navigationStepCurrent,
+        navigationStepTotal,
+        navigationStepsCompleted,
+
         sendMessage,
+        abortChat,
         clearChat,
         getPageContent,
         getPageText,

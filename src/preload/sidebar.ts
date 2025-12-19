@@ -40,6 +40,8 @@ const sidebarAPI = {
   sendChatMessage: (request: Partial<ChatRequest>) =>
     electronAPI.ipcRenderer.invoke("sidebar-chat-message", request),
 
+  abortChat: () => electronAPI.ipcRenderer.invoke("sidebar-chat-abort"),
+
   clearChat: () => electronAPI.ipcRenderer.invoke("sidebar-clear-chat"),
 
   getMessages: () => electronAPI.ipcRenderer.invoke("sidebar-get-messages"),

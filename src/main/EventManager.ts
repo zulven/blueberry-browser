@@ -173,6 +173,12 @@ export class EventManager {
       await this.mainWindow.sidebar.client.sendChatMessage(request);
     });
 
+    // Abort active chat run
+    ipcMain.handle("sidebar-chat-abort", () => {
+      this.mainWindow.sidebar.client.abortActiveRun();
+      return true;
+    });
+
     // Clear chat
     ipcMain.handle("sidebar-clear-chat", () => {
       this.mainWindow.sidebar.client.clearMessages();

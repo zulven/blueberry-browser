@@ -42,6 +42,7 @@ interface SidebarAPI {
 
   // Chat functionality
   sendChatMessage: (request: Partial<ChatRequest>) => Promise<void>;
+  abortChat: () => Promise<boolean>;
   onChatResponse: (callback: (data: ChatResponse) => void) => void;
   removeChatResponseListener: () => void;
 

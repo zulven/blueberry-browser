@@ -28,6 +28,7 @@ export class GeminiComputerUseAgent {
     callbacks: GeminiComputerUseAgentCallbacks;
     existingContents?: any[];
     skipInitialUserTurn?: boolean;
+    abortSignal?: AbortSignal;
   }): Promise<void> {
     const excluded = Array.isArray(params.excludedPredefinedFunctions)
       ? params.excludedPredefinedFunctions
@@ -76,6 +77,7 @@ export class GeminiComputerUseAgent {
     };
 
     for (let step = 0; step < params.maxSteps; step++) {
+      if (params.abortSignal?.aborted) return;
       emitNavigation(`Computer Use: step ${step + 1}/${params.maxSteps}...\n`);
 
       const config: any = {
@@ -112,6 +114,7 @@ export class GeminiComputerUseAgent {
       const iterable: any = streamResult && (streamResult.stream ?? streamResult);
 
       for await (const chunk of iterable as any) {
+        if (params.abortSignal?.aborted) return;
         lastJson = chunk;
 
         const candidate =
@@ -156,8 +159,10 @@ export class GeminiComputerUseAgent {
           : null;
       const parts = candidate?.content?.parts;
 
-      if (candidate?.content) {
-        contents.push(candidate.content);
+      if (candidate?.content && Array.isArray((candidate.content as any).parts)) {
+        const role =
+          typeof (candidate.content as any).role === "string" ? (candidate.content as any).role : "model";
+        contents.push({ role, parts: (candidate.content as any).parts });
       } else if (Array.isArray(parts)) {
         contents.push({ role: "model", parts });
       }
@@ -208,6 +213,7 @@ export class GeminiComputerUseAgent {
       const executedResults: Array<{ name: string; response: any }> = [];
 
       for (const fc of functionCalls) {
+        if (params.abortSignal?.aborted) return;
         emitNavigation(
           `Computer Use: action ${fc.name} ${fc.args ? JSON.stringify(fc.args) : "{}"}\n`
         );
@@ -218,22 +224,25 @@ export class GeminiComputerUseAgent {
 
       // Capture the new environment state once after all actions.
       const afterShot = await callbacks.captureScreenshot();
-      const functionResponses: any[] = executedResults.map((executed) => ({
+      const functionResponseParts: any[] = executedResults.map((executed) => ({
         functionResponse: {
           name: executed.name,
           response: executed.response,
-          parts: [
-            {
-              inlineData: {
-                mimeType: "image/png",
-                data: afterShot.data,
-              },
-            },
-          ],
         },
       }));
 
-      contents.push({ role: "user", parts: functionResponses });
+      contents.push({
+        role: "user",
+        parts: [
+          ...functionResponseParts,
+          {
+            inlineData: {
+              mimeType: "image/png",
+              data: afterShot.data,
+            },
+          },
+        ],
+      });
     }
 
     emitNavigation("Computer Use: stopped (max steps reached).\n");

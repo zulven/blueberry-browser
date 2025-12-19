@@ -207,8 +207,9 @@ const LoadingIndicator: React.FC = () => {
 // Chat Input Component with pill design
 const ChatInput: React.FC<{
     onSend: (message: string) => void
+    onAbort: () => void
     disabled: boolean
-}> = ({ onSend, disabled }) => {
+}> = ({ onSend, onAbort, disabled }) => {
     const [value, setValue] = useState('')
     const [isFocused, setIsFocused] = useState(false)
     const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -237,7 +238,11 @@ const ChatInput: React.FC<{
     const handleKeyDown = (e: React.KeyboardEvent) => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault()
-            handleSubmit()
+            if (disabled) {
+                onAbort()
+            } else {
+                handleSubmit()
+            }
         }
     }
 
@@ -272,18 +277,34 @@ const ChatInput: React.FC<{
             {/* Send Button */}
             <div className="w-full flex items-center gap-1.5 px-1 mt-2 mb-1">
                 <div className="flex-1" />
-                <button
-                    onClick={handleSubmit}
-                    disabled={disabled || !value.trim()}
-                    className={cn(
-                        "size-9 rounded-full flex items-center justify-center",
-                        "transition-all duration-200",
-                        "bg-primary text-primary-foreground",
-                        "hover:opacity-80 disabled:opacity-50"
-                    )}
-                >
-                    <ArrowUp className="size-5" />
-                </button>
+                {disabled ? (
+                    <button
+                        onClick={onAbort}
+                        className={cn(
+                            "size-9 rounded-full flex items-center justify-center",
+                            "transition-all duration-200",
+                            "bg-red-500 text-white",
+                            "hover:bg-red-600"
+                        )}
+                        aria-label="Stop"
+                        title="Stop"
+                    >
+                        <span className="inline-block size-3.5 rounded-[2px] bg-white" />
+                    </button>
+                ) : (
+                    <button
+                        onClick={handleSubmit}
+                        disabled={!value.trim()}
+                        className={cn(
+                            "size-9 rounded-full flex items-center justify-center",
+                            "transition-all duration-200",
+                            "bg-primary text-primary-foreground",
+                            "hover:opacity-80 disabled:opacity-50"
+                        )}
+                    >
+                        <ArrowUp className="size-5" />
+                    </button>
+                )}
             </div>
         </div>
     )
@@ -302,7 +323,11 @@ const ConversationTurnComponent: React.FC<{
     isReasoningComplete?: boolean
     navigation?: string
     isNavigationComplete?: boolean
-}> = ({ turn, isLoading, reasoning, isReasoningComplete, navigation, isNavigationComplete }) => {
+    navigationStepCurrent?: number | null
+    navigationStepTotal?: number | null
+    navigationStepsCompleted?: number
+}> = ({ turn, isLoading, reasoning, isReasoningComplete, navigation, isNavigationComplete, navigationStepCurrent, navigationStepTotal, navigationStepsCompleted }) => {
+
     const [isReasoningCollapsed, setIsReasoningCollapsed] = useState(false)
     const [isNavigationCollapsed, setIsNavigationCollapsed] = useState(false)
 
@@ -359,19 +384,17 @@ const ConversationTurnComponent: React.FC<{
     return (
         <div className="pt-12 flex flex-col gap-8">
             {turn.user && <UserMessage content={turn.user.content} />}
-
             {turn.user && reasoning && reasoning.length > 0 && (
                 <div className="pt-4">
                     <div className="rounded-2xl border border-border bg-muted/40 dark:bg-muted/20 p-4">
                         <div className="flex items-center justify-between gap-3 mb-2">
-                            <div className="text-xs font-medium text-muted-foreground flex items-center gap-2">
-
+                            <div className="text-sm font-medium text-muted-foreground flex items-center gap-2">
                                 <span
                                     className={cn(
                                         "inline-block size-2.5 rounded-full",
                                         "shadow-[0_0_0_2px_rgba(255,255,255,0.04)]",
                                         !isReasoningComplete
-                                            ? "animate-pulse bg-muted-foreground/50"
+                                            ? "animate-pulse border border-teal-400/75 bg-transparent"
                                             : "bg-teal-400/75"
                                     )}
                                 />
@@ -380,6 +403,7 @@ const ConversationTurnComponent: React.FC<{
                                     ? 'Thinking'
                                     : `Thought for ${Math.max(0, thinkingElapsedMs / 1000).toFixed(1)}s`}
                             </div>
+
                             <button
                                 type="button"
                                 onClick={() => setIsReasoningCollapsed((v) => !v)}
@@ -420,25 +444,36 @@ const ConversationTurnComponent: React.FC<{
             {turn.user && navigation && navigation.length > 0 && (
                 <div className="pt-4">
                     <div className="rounded-2xl border border-border bg-muted/40 dark:bg-muted/20 p-4">
-
                         <div className="flex items-center justify-between gap-3 mb-2">
-                            <div className="text-xs font-medium text-muted-foreground flex items-center gap-2">
+                            <div className="text-sm font-medium text-muted-foreground flex items-center gap-2">
                                 <span
                                     className={cn(
                                         "inline-block size-2.5 rounded-full",
                                         "shadow-[0_0_0_2px_rgba(255,255,255,0.04)]",
                                         !isNavigationComplete
-                                            ? "animate-pulse bg-muted-foreground/50"
+                                            ? "animate-pulse border border-indigo-400/75 bg-transparent"
                                             : "bg-indigo-400/75"
                                     )}
                                 />
 
-                                {!isNavigationComplete ? 'Navigation' : 'Navigation log'}
+                                <span>Navigation log</span>
+
+                                {!isNavigationComplete ? (
+                                    typeof navigationStepCurrent === 'number' &&
+                                    typeof navigationStepTotal === 'number' &&
+                                    Number.isFinite(navigationStepCurrent) &&
+                                    Number.isFinite(navigationStepTotal) ? (
+                                        <span>{`Step ${navigationStepCurrent}/${navigationStepTotal}`}</span>
+                                    ) : null
+                                ) : (
+                                    (typeof navigationStepsCompleted === 'number' ? navigationStepsCompleted : 0) > 0
+                                        ? <span>{`(${typeof navigationStepsCompleted === 'number' ? navigationStepsCompleted : 0} steps)`}</span>
+                                        : null
+                                )}
                             </div>
                             <button
                                 type="button"
                                 onClick={() => setIsNavigationCollapsed((v) => !v)}
-
                                 className={cn(
                                     "inline-flex items-center justify-center",
                                     "size-7 rounded-md",
@@ -464,10 +499,24 @@ const ConversationTurnComponent: React.FC<{
                                     : "scale-y-100 opacity-100 max-h-[1000px]"
                             )}
                         >
-                            <Markdown
-                                content={navigation}
-                                className="opacity-55 prose-p:text-muted-foreground/45 prose-li:text-muted-foreground/45 prose-headings:text-muted-foreground/45 prose-strong:text-foreground/60 prose-code:text-muted-foreground/50"
-                            />
+                            <div className="text-sm font-medium text-muted-foreground whitespace-pre-wrap">
+                                {(() => {
+                                    const lines = navigation
+                                        .split(/\r?\n+/)
+                                        .map((l) => l.trim())
+                                        .filter((l) => l.length > 0)
+
+                                    let n = 0
+                                    return lines.map((line, idx) => {
+                                        if (line === 'Navigation complete') {
+                                            return <div key={`nav-line-${idx}`}>{line}</div>
+                                        }
+
+                                        n += 1
+                                        return <div key={`nav-line-${idx}`}>{n}. {line}</div>
+                                    })
+                                })()}
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -491,7 +540,7 @@ const ConversationTurnComponent: React.FC<{
 
 // Main Chat Component
 export const Chat: React.FC = () => {
-    const { messages, isLoading, sendMessage, clearChat, reasoning, isReasoningComplete, navigation, isNavigationComplete } = useChat()
+    const { messages, isLoading, sendMessage, abortChat, clearChat, reasoning, isReasoningComplete, navigation, isNavigationComplete, navigationStepCurrent, navigationStepTotal, navigationStepsCompleted } = useChat()
 
     const scrollRef = useAutoScroll(messages)
 
@@ -572,6 +621,9 @@ export const Chat: React.FC = () => {
                                             isReasoningComplete={isReasoningComplete}
                                             navigation={showNavigationInline ? navigation : undefined}
                                             isNavigationComplete={isNavigationComplete}
+                                            navigationStepCurrent={navigationStepCurrent}
+                                            navigationStepTotal={navigationStepTotal}
+                                            navigationStepsCompleted={navigationStepsCompleted}
                                             isLoading={
                                                 showLoadingAfterLastTurn &&
                                                 index === conversationTurns.length - 1
@@ -590,7 +642,7 @@ export const Chat: React.FC = () => {
 
             {/* Input Area */}
             <div className="p-4">
-                <ChatInput onSend={sendMessage} disabled={isLoading} />
+                <ChatInput onSend={sendMessage} onAbort={abortChat} disabled={isLoading} />
             </div>
         </div>
     )

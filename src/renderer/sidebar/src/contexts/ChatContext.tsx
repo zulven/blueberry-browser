@@ -248,14 +248,40 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
                         pretty = 'Searching'
                     } else if (lowerAction.includes('click')) {
                         pretty = 'Clicking element'
+                    } else if (lowerAction.includes('hover')) {
+                        pretty = 'Hovering'
+                    } else if (lowerAction.includes('drag')) {
+                        pretty = 'Dragging'
                     } else if (lowerAction.includes('scroll')) {
                         pretty = 'Scrolling'
                     } else if (
                         lowerAction.includes('navigate') ||
+                        lowerAction.includes('open_page') ||
                         lowerAction.includes('open_url') ||
                         lowerAction.includes('openurl')
                     ) {
-                        pretty = 'Opening page'
+                        const url =
+                            parsedArgs &&
+                            typeof parsedArgs.url === 'string' &&
+                            parsedArgs.url.trim().length > 0
+                                ? parsedArgs.url.trim()
+                                : parsedArgs &&
+                                    typeof parsedArgs.href === 'string' &&
+                                    parsedArgs.href.trim().length > 0
+                                    ? parsedArgs.href.trim()
+                                    : parsedArgs &&
+                                        typeof parsedArgs.destination === 'string' &&
+                                        parsedArgs.destination.trim().length > 0
+                                        ? parsedArgs.destination.trim()
+                                        : ''
+
+                        pretty = url ? `Opening page “${url}”` : 'Opening page'
+                    } else if (lowerAction.includes('go_back')) {
+                        pretty = 'Going back'
+                    } else if (lowerAction.includes('go_forward')) {
+                        pretty = 'Going forward'
+                    } else if (lowerAction.includes('open_web_browser')) {
+                        pretty = 'Opening browser'
                     } else if (lowerAction.includes('wait')) {
                         pretty = 'Waiting'
                     } else if (lowerAction.includes('key') || lowerAction.includes('keypress')) {

@@ -17,21 +17,38 @@ interface Message {
 }
 
 // Auto-scroll hook
-const useAutoScroll = (messages: Message[]) => {
+const useAutoScroll = (params: {
+    scrollContainerRef: React.RefObject<HTMLDivElement | null>
+    deps: any[]
+}) => {
+    const { scrollContainerRef, deps } = params
     const scrollRef = useRef<HTMLDivElement>(null)
-    const prevCount = useRef(0)
+    const shouldAutoScrollRef = useRef(true)
+
+    useEffect(() => {
+        const el = scrollContainerRef.current
+        if (!el) return
+
+        const nearBottomThresholdPx = 140
+        const update = () => {
+            const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+            shouldAutoScrollRef.current = distanceFromBottom <= nearBottomThresholdPx
+        }
+
+        update()
+        el.addEventListener('scroll', update, { passive: true })
+        return () => el.removeEventListener('scroll', update)
+    }, [scrollContainerRef])
 
     useLayoutEffect(() => {
-        if (messages.length > prevCount.current) {
-            setTimeout(() => {
-                scrollRef.current?.scrollIntoView({
-                    behavior: 'smooth',
-                    block: 'end'
-                })
-            }, 100)
-        }
-        prevCount.current = messages.length
-    }, [messages.length])
+        if (!shouldAutoScrollRef.current) return
+        // allow layout to settle (markdown, syntax highlight, etc)
+        window.setTimeout(() => {
+            if (!shouldAutoScrollRef.current) return
+            scrollRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+        }, 50)
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, deps)
 
     return scrollRef
 }
@@ -209,7 +226,8 @@ const ChatInput: React.FC<{
     onSend: (message: string) => void
     onAbort: () => void
     disabled: boolean
-}> = ({ onSend, onAbort, disabled }) => {
+    onAfterSend?: () => void
+}> = ({ onSend, onAbort, disabled, onAfterSend }) => {
     const [value, setValue] = useState('')
     const [isFocused, setIsFocused] = useState(false)
     const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -227,6 +245,7 @@ const ChatInput: React.FC<{
     const handleSubmit = () => {
         if (value.trim() && !disabled) {
             onSend(value.trim())
+            onAfterSend?.()
             setValue('')
             // Reset textarea height
             if (textareaRef.current) {
@@ -456,7 +475,7 @@ const ConversationTurnComponent: React.FC<{
                                     )}
                                 />
 
-                                <span>Navigation log</span>
+                                <span>{!isNavigationComplete ? 'Navigating...' : 'Navigation log'}</span>
 
                                 {!isNavigationComplete ? (
                                     typeof navigationStepCurrent === 'number' &&
@@ -542,7 +561,17 @@ const ConversationTurnComponent: React.FC<{
 export const Chat: React.FC = () => {
     const { messages, isLoading, sendMessage, abortChat, clearChat, reasoning, isReasoningComplete, navigation, isNavigationComplete, navigationStepCurrent, navigationStepTotal, navigationStepsCompleted } = useChat()
 
-    const scrollRef = useAutoScroll(messages)
+    const scrollContainerRef = useRef<HTMLDivElement>(null)
+    const scrollRef = useAutoScroll({
+        scrollContainerRef,
+        deps: [messages.length, reasoning.length, navigation.length]
+    })
+
+    const scrollToBottomNow = () => {
+        window.setTimeout(() => {
+            scrollRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
+        }, 0)
+    }
 
     // Group messages into conversation turns
     const conversationTurns: ConversationTurn[] = []
@@ -568,7 +597,7 @@ export const Chat: React.FC = () => {
     return (
         <div className="flex flex-col h-full bg-background">
             {/* Messages Area */}
-            <div className="flex-1 overflow-y-auto">
+            <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
 
                 <div className="h-8 max-w-3xl mx-auto px-4">
                     {/* New Chat Button - Floating */}
@@ -642,7 +671,12 @@ export const Chat: React.FC = () => {
 
             {/* Input Area */}
             <div className="p-4">
-                <ChatInput onSend={sendMessage} onAbort={abortChat} disabled={isLoading} />
+                <ChatInput
+                    onSend={sendMessage}
+                    onAbort={abortChat}
+                    disabled={isLoading}
+                    onAfterSend={scrollToBottomNow}
+                />
             </div>
         </div>
     )

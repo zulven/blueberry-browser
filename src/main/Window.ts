@@ -137,7 +137,7 @@ export class Window {
       try {
         const parsed = new URL(details.url);
         if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-          this.createTab(details.url);
+          tab.loadURL(details.url);
           return { action: "deny" };
         }
       } catch {

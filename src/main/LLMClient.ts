@@ -66,6 +66,110 @@ export class LLMClient {
   private highlightTrackTimer: NodeJS.Timeout | null = null;
   private highlightTrackUrl: string | null = null;
 
+  private shouldLogModelInput(): boolean {
+    const raw = process.env.AI_LOG_MODEL_INPUT;
+    return raw === "1" || raw === "true";
+  }
+
+  private redactCoreMessagesForLogging(messages: CoreMessage[]): any[] {
+    const redact = (value: any): any => {
+      if (!value || typeof value !== "object") return value;
+      if (Array.isArray(value)) return value.map(redact);
+
+      // AI SDK image parts: { type: 'image', image: 'data:...' }
+      if (value.type === "image") {
+        const image = typeof value.image === "string" ? value.image : null;
+        return {
+          ...value,
+          image: image ? `[redacted image dataurl len=${image.length}]` : "[redacted image]",
+        };
+      }
+
+      const out: any = {};
+      for (const [k, v] of Object.entries(value)) {
+        if (k === "image" && typeof v === "string") {
+          out[k] = `[redacted image dataurl len=${v.length}]`;
+          continue;
+        }
+        out[k] = redact(v);
+      }
+      return out;
+    };
+
+    return messages.map((m) => ({
+      role: (m as any).role,
+      content: redact((m as any).content),
+    }));
+  }
+
+  private redactGeminiContentsForLogging(contents: any[]): any[] {
+    const redact = (value: any): any => {
+      if (!value || typeof value !== "object") return value;
+      if (Array.isArray(value)) return value.map(redact);
+
+      // Gemini image parts: { inlineData: { mimeType, data } }
+      if (value.inlineData && typeof value.inlineData === "object") {
+        const data = (value.inlineData as any).data;
+        const dataLen = typeof data === "string" ? data.length : 0;
+        return {
+          ...value,
+          inlineData: {
+            ...(value.inlineData as any),
+            data: dataLen > 0 ? `[redacted base64 len=${dataLen}]` : "[redacted base64]",
+          },
+        };
+      }
+
+      const out: any = {};
+      for (const [k, v] of Object.entries(value)) {
+        if (k === "data" && typeof v === "string") {
+          out[k] = `[redacted base64 len=${v.length}]`;
+          continue;
+        }
+        out[k] = redact(v);
+      }
+      return out;
+    };
+
+    return Array.isArray(contents) ? contents.map(redact) : [];
+  }
+
+  private logModelInputNormal(messages: CoreMessage[]): void {
+    if (!this.shouldLogModelInput()) return;
+    try {
+      console.log("[MODEL_INPUT] mode=normal provider=%s model=%s", this.provider, this.modelName);
+      console.log(JSON.stringify(this.redactCoreMessagesForLogging(messages), null, 2));
+    } catch {
+      // ignore
+    }
+  }
+
+  private logModelInputGeminiComputerUse(params: {
+    systemInstruction: string;
+    contents: any[];
+    maxSteps: number;
+    excludedPredefinedFunctions: string[];
+  }): void {
+    if (!this.shouldLogModelInput()) return;
+    try {
+      console.log("[MODEL_INPUT] mode=gemini_cu provider=%s model=%s", this.provider, this.modelName);
+      console.log(
+        JSON.stringify(
+          {
+            systemInstruction: params.systemInstruction,
+            maxSteps: params.maxSteps,
+            excludedPredefinedFunctions: params.excludedPredefinedFunctions,
+            contents: this.redactGeminiContentsForLogging(params.contents),
+          },
+          null,
+          2
+        )
+      );
+    } catch {
+      // ignore
+    }
+  }
+
   private stopHighlightTracking(): void {
     if (this.highlightTrackTimer) {
       clearInterval(this.highlightTrackTimer);
@@ -283,13 +387,12 @@ export class LLMClient {
       }),
 
       getPageText: tool({
-        description:
-          "Get the visible text of a tab. If tabId is omitted, uses the active tab.",
+        description: "Get the text content of the current page. If tabId is omitted, uses the active tab.",
         inputSchema: z.object({ tabId: z.string().optional() }),
         execute: async ({ tabId }) => {
           const tab = this.getTabByIdOrActive(tabId);
           if (!tab) return { text: "" };
-          const text = await tab.getTabText();
+          const text = await tab.getViewportText();
           return { text: this.truncateText(text, MAX_CONTEXT_LENGTH) };
         },
       }),
@@ -483,6 +586,29 @@ export class LLMClient {
         return;
       }
 
+      // Gemini Computer Use does not use the normal system-message flow.
+      // Build the system instruction once and go straight into the CU loop to avoid
+      // calling buildSystemPrompt() twice per interaction.
+      if (this.isGeminiComputerUseModel()) {
+        const tab = await this.getActiveTabOrThrow();
+        let pageText: string | null = null;
+        try {
+          pageText = await tab.getViewportText();
+        } catch (error) {
+          console.error("Failed to get viewport text (Gemini CU):", error);
+          pageText = null;
+        }
+
+        const systemInstruction = this.buildSystemPrompt(tab.url, pageText);
+        await this.geminiComputerUseLoop({
+          messageId: request.messageId,
+          userPrompt: request.message,
+          systemInstruction,
+          abortSignal: this.activeRunAbortController.signal,
+        });
+        return;
+      }
+
       const messages = await this.prepareMessagesWithContext(request);
       await this.streamResponse(messages, request.messageId, this.activeRunAbortController.signal);
     } catch (error) {
@@ -589,7 +715,7 @@ export class LLMClient {
       if (activeTab) {
         pageUrl = activeTab.url;
         try {
-          pageText = await activeTab.getTabText();
+          pageText = await activeTab.getViewportText();
         } catch (error) {
           console.error("Failed to get page text:", error);
         }
@@ -608,9 +734,13 @@ export class LLMClient {
 
   private buildSystemPrompt(url: string | null, pageText: string | null): string {
     const parts: string[] = [
-      "You are a helpful AI assistant integrated into a web browser.",
-      "You can analyze and discuss web pages with the user.",
-      "The user's messages may include screenshots of the current page as the first image.",
+      "You are a Berry, a helpful AI assistant integrated into a the Blueberry web browser.",
+      "You are able to autnomously navigate the browser and interact with webpages in order to fulfill the user's query when needed.",
+      "You have detailed context about the browser that user might not have.", 
+      "The user only sees the webpages as they are. So NEVER mention details like coordinates (x=,y=) on a page, only refer to visual queues available to the user",
+      "You reflect before you answer to understand the user full intent and evaluate if you can answer immediately or need to navigate the web/interact with pages.",
+      "When navigation/interaction is necessary you plan your actions.",
+      "If an interaction is risky (editing/deleting... on a non public site), if you are unsure or need the user to provide info/interact, alwyas prompt the user to intervene."
     ];
 
     if (url) {
@@ -619,14 +749,21 @@ export class LLMClient {
 
     if (pageText) {
       const truncatedText = this.truncateText(pageText, MAX_CONTEXT_LENGTH);
-      parts.push(`\nPage content (text):\n${truncatedText}`);
+      parts.push(`\nPage text content (in viewport):\n${truncatedText}`);
     }
 
     parts.push(
-      "\nPlease provide helpful, accurate, and contextual responses about the current webpage.",
-      "If the user asks about specific content, refer to the page content and/or screenshot provided."
+      "\nPlease provide helpful, accurate responses. Use emojis only to emphasize/illustrate key concepts/words. Always evaluate/verify that you've accomplished the expected result when navigating.",
+
     );
 
+    if (this.shouldLogModelInput()) {
+      try {
+        console.log("[SYSTEM_PROMPT]" + "\n" + parts.join("\n"));
+      } catch {
+        // ignore
+      }
+    }
     return parts.join("\n");
   }
 
@@ -815,6 +952,19 @@ export class LLMClient {
           await tab.loadURL(url);
           return { name: action.name, response: { ok: true, url } };
         }
+        case "open_page":
+        case "open_url":
+        case "openurl": {
+          const rawUrl = (args as any).url ?? (args as any).href ?? (args as any).destination;
+          const url = typeof rawUrl === "string" ? rawUrl : "";
+          if (!url)
+            return {
+              name: action.name,
+              response: { ok: false, error: "Missing url", url: tab.url },
+            };
+          await tab.loadURL(url);
+          return { name: action.name, response: { ok: true, url } };
+        }
         case "navigate": {
           const rawUrl = (args as any).url;
           const url =
@@ -842,8 +992,20 @@ export class LLMClient {
           return { name: action.name, response: { ok: true, url: tab.url } };
         }
         case "wait_5_seconds": {
-          await new Promise((r) => setTimeout(r, 5000));
+          await new Promise((r) => setTimeout(r, 2000));
           return { name: action.name, response: { ok: true, url: tab.url } };
+        }
+        case "wait": {
+          const seconds = typeof (args as any).seconds === "number" ? (args as any).seconds : null;
+          const msRaw = typeof (args as any).ms === "number" ? (args as any).ms : null;
+          const ms =
+            typeof msRaw === "number" && Number.isFinite(msRaw)
+              ? Math.max(0, Math.min(60_000, Math.round(msRaw)))
+              : typeof seconds === "number" && Number.isFinite(seconds)
+                ? Math.max(0, Math.min(60_000, Math.round(seconds * 1000)))
+                : 2000;
+          await new Promise((r) => setTimeout(r, ms));
+          return { name: action.name, response: { ok: true, waitedMs: ms, url: tab.url } };
         }
         case "click_at":
         case "hover_at": {
@@ -1092,6 +1254,8 @@ export class LLMClient {
       ? Math.max(1, Math.min(50, Number(maxStepsRaw)))
       : 15;
 
+    const excludedPredefinedFunctions = ["open_web_browser"];
+
     let messageIndex: number | null = null;
     let resetAssistantOnNextDelta = false;
     let sentAnyNavigationDelta = false;
@@ -1137,6 +1301,13 @@ export class LLMClient {
     this.activeGeminiComputerUseRunId = params.messageId;
     this.geminiComputerUseNavigationOverlayBuffer = "";
 
+    this.logModelInputGeminiComputerUse({
+      systemInstruction: params.systemInstruction,
+      contents: this.geminiComputerUseContents,
+      maxSteps,
+      excludedPredefinedFunctions,
+    });
+
     const ensureOverlayStarted = (): Promise<void> => {
       if (overlayStarted) return overlayStartPromise ?? Promise.resolve();
       overlayStarted = true;
@@ -1152,7 +1323,7 @@ export class LLMClient {
         userPrompt: params.userPrompt,
         systemInstruction: params.systemInstruction,
         maxSteps,
-        excludedPredefinedFunctions: ["open_web_browser"],
+        excludedPredefinedFunctions,
         existingContents: this.geminiComputerUseContents,
         skipInitialUserTurn: true,
         abortSignal: params.abortSignal,
@@ -1288,7 +1459,7 @@ export class LLMClient {
       const tab = await this.getActiveTabOrThrow();
       let pageText: string | null = null;
       try {
-        pageText = await tab.getTabText();
+        pageText = await tab.getViewportText();
       } catch {
         pageText = null;
       }
@@ -1370,6 +1541,8 @@ export class LLMClient {
             : undefined;
 
         const tools = this.getTools() as any;
+
+        this.logModelInputNormal(messages);
 
         const result = await streamText({
           model,

@@ -10,6 +10,7 @@
     "src/renderer/sidebar/**/*.tsx",
     "src/renderer/topbar/**/*",
     "src/renderer/topbar/**/*.tsx",
+    "src/shared/**/*",
     "src/preload/*.d.ts"
   ],
   "compilerOptions": {

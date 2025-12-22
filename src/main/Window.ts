@@ -1,8 +1,13 @@
-import { BaseWindow, shell } from "electron";
+import { BaseWindow, nativeTheme, screen, shell } from "electron";
 import { Tab } from "./Tab";
 import { TopBar } from "./TopBar";
 import { SideBar } from "./SideBar";
 import { AgentOverlay } from "./AgentOverlay";
+
+const TAB_TOPBAR_HEIGHT = 88;
+const TARGET_ASPECT_RATIO = 1440 / 900;
+
+const getChromeBackgroundColor = (): string => (nativeTheme.shouldUseDarkColors ? "#141414" : "#ffffff");
 
 export class Window {
   private _baseWindow: BaseWindow;
@@ -21,6 +26,7 @@ export class Window {
       show: true,
       autoHideMenuBar: false,
       titleBarStyle: "hidden",
+      backgroundColor: getChromeBackgroundColor(),
       ...(process.platform !== "darwin" ? { titleBarOverlay: true } : {}),
       trafficLightPosition: { x: 15, y: 13 },
     });
@@ -40,6 +46,24 @@ export class Window {
 
     // Create the first tab
     this.createTab();
+
+    nativeTheme.on("updated", () => {
+      const bg = getChromeBackgroundColor();
+      try {
+        const anyWin = this._baseWindow as any;
+        if (anyWin && typeof anyWin.setBackgroundColor === "function") {
+          anyWin.setBackgroundColor(bg);
+        }
+      } catch {
+        // ignore
+      }
+
+      try {
+        this.tabsMap.forEach((tab) => tab.setBackgroundColor(bg));
+      } catch {
+        // ignore
+      }
+    });
 
     // Set up window resize handler
     this._baseWindow.on("resize", () => {
@@ -94,6 +118,63 @@ export class Window {
     this.setupEventListeners();
   }
 
+  private shouldLockTabAspectRatio(): boolean {
+    const raw = process.env.AI_LOCK_TAB_ASPECT_RATIO;
+    return raw === "1" || raw === "true";
+  }
+
+  private getTabContainerBounds(): { x: number; y: number; width: number; height: number } {
+    const bounds = this._baseWindow.getBounds();
+    const sidebarWidth = this._sideBar.getIsVisible() ? this._sideBar.getWidth() : 0;
+
+    return {
+      x: 0,
+      y: TAB_TOPBAR_HEIGHT,
+      width: Math.max(0, bounds.width - sidebarWidth),
+      height: Math.max(0, bounds.height - TAB_TOPBAR_HEIGHT),
+    };
+  }
+
+  private fitAspectRatioWithin(bounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }): { x: number; y: number; width: number; height: number } {
+    const w = Math.max(0, Math.floor(bounds.width));
+    const h = Math.max(0, Math.floor(bounds.height));
+    if (w === 0 || h === 0) return bounds;
+
+    const containerAspect = w / h;
+    let fitW = w;
+    let fitH = h;
+
+    if (containerAspect > TARGET_ASPECT_RATIO) {
+      // Too wide: height is limiting.
+      fitH = h;
+      fitW = Math.floor(h * TARGET_ASPECT_RATIO);
+    } else {
+      // Too tall (or equal): width is limiting.
+      fitW = w;
+      fitH = Math.floor(w / TARGET_ASPECT_RATIO);
+    }
+
+    const offsetX = Math.floor((w - fitW) / 2);
+    const offsetY = Math.floor((h - fitH) / 2);
+
+    return {
+      x: bounds.x + offsetX,
+      y: bounds.y + offsetY,
+      width: fitW,
+      height: fitH,
+    };
+  }
+
+  private getTabBoundsForLayout(): { x: number; y: number; width: number; height: number } {
+    const container = this.getTabContainerBounds();
+    return this.shouldLockTabAspectRatio() ? this.fitAspectRatioWithin(container) : container;
+  }
+
   private setupEventListeners(): void {
     this._baseWindow.on("closed", () => {
       // Clean up all tabs when window is closed
@@ -133,6 +214,8 @@ export class Window {
     const tabId = `tab-${++this.tabCounter}`;
     const tab = new Tab(tabId, url);
 
+    tab.setBackgroundColor(getChromeBackgroundColor());
+
     tab.webContents.setWindowOpenHandler((details) => {
       try {
         const parsed = new URL(details.url);
@@ -152,14 +235,7 @@ export class Window {
     this._baseWindow.contentView.addChildView(tab.view);
 
     // Set the bounds to fill the window below the topbar and to the left of sidebar
-    const bounds = this._baseWindow.getBounds();
-    const sidebarWidth = this._sideBar.getIsVisible() ? this._sideBar.getWidth() : 0;
-    tab.view.setBounds({
-      x: 0,
-      y: 88, // Start below the topbar
-      width: bounds.width - sidebarWidth,
-      height: bounds.height - 88, // Subtract topbar height
-    });
+    tab.view.setBounds(this.getTabBoundsForLayout());
 
     this.updateOverlayBounds();
 
@@ -289,31 +365,94 @@ export class Window {
     return this._baseWindow.getBounds();
   }
 
+  resizeTabContainerToExactAspectRatio(): boolean {
+    try {
+      const current = this._baseWindow.getBounds();
+      const sidebarWidth = this._sideBar.getIsVisible() ? this._sideBar.getWidth() : 0;
+
+      const containerW = Math.max(1, Math.floor(current.width - sidebarWidth));
+      const containerH = Math.max(1, Math.floor(current.height - TAB_TOPBAR_HEIGHT));
+
+      const currentAspect = containerW / containerH;
+
+      let targetWindowW = current.width;
+      let targetWindowH = current.height;
+
+      if (currentAspect > TARGET_ASPECT_RATIO) {
+        // Too wide: expand height.
+        const targetContainerH = Math.ceil(containerW / TARGET_ASPECT_RATIO);
+        targetWindowH = targetContainerH + TAB_TOPBAR_HEIGHT;
+      } else if (currentAspect < TARGET_ASPECT_RATIO) {
+        // Too tall: expand width.
+        const targetContainerW = Math.ceil(containerH * TARGET_ASPECT_RATIO);
+        targetWindowW = targetContainerW + sidebarWidth;
+      } else {
+        return true;
+      }
+
+      // Respect minimum window size.
+      targetWindowW = Math.max(1000, Math.floor(targetWindowW));
+      targetWindowH = Math.max(800, Math.floor(targetWindowH));
+
+      // Clamp to the current display work area.
+      const display = screen.getDisplayMatching(current);
+      const workArea = display?.workArea ?? display?.bounds;
+      const maxW = typeof workArea?.width === "number" ? workArea.width : targetWindowW;
+      const maxH = typeof workArea?.height === "number" ? workArea.height : targetWindowH;
+      const clampedW = Math.min(targetWindowW, maxW);
+      const clampedH = Math.min(targetWindowH, maxH);
+
+      // Preserve center when resizing.
+      const centerX = current.x + Math.floor(current.width / 2);
+      const centerY = current.y + Math.floor(current.height / 2);
+      let nextX = centerX - Math.floor(clampedW / 2);
+      let nextY = centerY - Math.floor(clampedH / 2);
+
+      if (workArea) {
+        const minX = typeof workArea.x === "number" ? workArea.x : nextX;
+        const minY = typeof workArea.y === "number" ? workArea.y : nextY;
+        const maxX2 = minX + maxW;
+        const maxY2 = minY + maxH;
+
+        if (nextX < minX) nextX = minX;
+        if (nextY < minY) nextY = minY;
+        if (nextX + clampedW > maxX2) nextX = Math.max(minX, maxX2 - clampedW);
+        if (nextY + clampedH > maxY2) nextY = Math.max(minY, maxY2 - clampedH);
+      }
+
+      try {
+        if (this._baseWindow.isMaximized()) {
+          this._baseWindow.unmaximize();
+        }
+      } catch {
+        // ignore
+      }
+
+      this._baseWindow.setBounds({ x: nextX, y: nextY, width: clampedW, height: clampedH });
+      this.updateAllBounds();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // Handle window resize to update tab bounds
   private updateTabBounds(): void {
-    const bounds = this._baseWindow.getBounds();
-    // Only subtract sidebar width if it's visible
-    const sidebarWidth = this._sideBar.getIsVisible() ? this._sideBar.getWidth() : 0;
+    const tabBounds = this.getTabBoundsForLayout();
 
     this.tabsMap.forEach((tab) => {
-      tab.view.setBounds({
-        x: 0,
-        y: 88, // Start below the topbar
-        width: bounds.width - sidebarWidth,
-        height: bounds.height - 88, // Subtract topbar height
-      });
+      tab.view.setBounds(tabBounds);
     });
   }
 
   private updateOverlayBounds(): void {
-    const bounds = this._baseWindow.getBounds();
-    const sidebarWidth = this._sideBar.getIsVisible() ? this._sideBar.getWidth() : 0;
+    const tabBounds = this.getTabBoundsForLayout();
     if (this._agentOverlay) {
       this._agentOverlay.setBounds({
-        x: 0,
-        y: 88,
-        width: bounds.width - sidebarWidth,
-        height: bounds.height - 88,
+        x: tabBounds.x,
+        y: tabBounds.y,
+        width: tabBounds.width,
+        height: tabBounds.height,
       });
     }
   }

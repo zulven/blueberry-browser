@@ -189,6 +189,11 @@ export class EventManager {
     ipcMain.handle("sidebar-get-messages", () => {
       return this.mainWindow.sidebar.client.getMessages();
     });
+
+    // Resize window so the tab container becomes exactly 16:10.
+    ipcMain.handle("resize-tab-container-16-10", () => {
+      return this.mainWindow.resizeTabContainerToExactAspectRatio();
+    });
   }
 
   private handlePageContentEvents(): void {

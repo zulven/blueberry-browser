@@ -28,6 +28,9 @@ interface TopBarAPI {
 
   // Sidebar
   toggleSidebar: () => Promise<void>;
+
+  // Window sizing
+  resizeTabContainerTo16by10: () => Promise<boolean>;
 }
 
 declare global {

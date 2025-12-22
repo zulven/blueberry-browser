@@ -1,4 +1,5 @@
-import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react'
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react'
+import { parseComputerUseNavigationDelta } from '../../../../shared/navigationPretty'
 
 interface Message {
     id: string
@@ -197,101 +198,15 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         const handleChatNavigation = (data: { messageId: string; content: string; isComplete: boolean }) => {
             if (data.content) {
-                navigationLineBufferRef.current += data.content
-                const parts = navigationLineBufferRef.current.split(/\r?\n/)
-                const completeLines = parts.slice(0, -1)
-                navigationLineBufferRef.current = parts[parts.length - 1] ?? ''
+                const parsed = parseComputerUseNavigationDelta(data.content, navigationLineBufferRef.current)
+                navigationLineBufferRef.current = parsed.nextBuffer
 
-                const prettyLines: string[] = []
-
-                for (const rawLine of completeLines) {
-                    const line = rawLine.trim()
-                    if (!line) continue
-
-                    const cleaned = line.replace(/^Computer Use\s*:\s*/i, '').trim()
-
-                    const stepMatch = cleaned.match(/\bstep\s+(\d+)\s*\/\s*(\d+)\b/i)
-                    if (stepMatch) {
-                        const cur = Number(stepMatch[1])
-                        const total = Number(stepMatch[2])
-                        if (Number.isFinite(cur)) setNavigationStepCurrent(cur)
-                        if (Number.isFinite(total)) setNavigationStepTotal(total)
-                        continue
-                    }
-
-                    if (/\bdone\b/i.test(cleaned) && /no more actions/i.test(cleaned)) {
-                        continue
-                    }
-
-                    const jsonStart = cleaned.indexOf('{')
-                    const actionPart = (jsonStart >= 0 ? cleaned.slice(0, jsonStart) : cleaned).trim()
-                    const jsonPart = jsonStart >= 0 ? cleaned.slice(jsonStart).trim() : ''
-
-                    let parsedArgs: any = null
-                    if (jsonPart) {
-                        try {
-                            parsedArgs = JSON.parse(jsonPart)
-                        } catch {
-                            parsedArgs = null
-                        }
-                    }
-
-                    const lowerAction = actionPart.toLowerCase()
-
-                    let pretty = ''
-                    if (lowerAction.includes('type_text')) {
-                        const text = parsedArgs && typeof parsedArgs.text === 'string' ? parsedArgs.text : ''
-                        const enter = parsedArgs && typeof parsedArgs.enter === 'boolean' ? parsedArgs.enter : false
-                        const safeText = text.length > 0 ? ` “${text}”` : ''
-                        pretty = enter ? `Submitting${safeText}` : `Typing${safeText}`
-                    } else if (lowerAction.includes('search')) {
-                        pretty = 'Searching'
-                    } else if (lowerAction.includes('click')) {
-                        pretty = 'Clicking element'
-                    } else if (lowerAction.includes('hover')) {
-                        pretty = 'Hovering'
-                    } else if (lowerAction.includes('drag')) {
-                        pretty = 'Dragging'
-                    } else if (lowerAction.includes('scroll')) {
-                        pretty = 'Scrolling'
-                    } else if (
-                        lowerAction.includes('navigate') ||
-                        lowerAction.includes('open_page') ||
-                        lowerAction.includes('open_url') ||
-                        lowerAction.includes('openurl')
-                    ) {
-                        const url =
-                            parsedArgs &&
-                            typeof parsedArgs.url === 'string' &&
-                            parsedArgs.url.trim().length > 0
-                                ? parsedArgs.url.trim()
-                                : parsedArgs &&
-                                    typeof parsedArgs.href === 'string' &&
-                                    parsedArgs.href.trim().length > 0
-                                    ? parsedArgs.href.trim()
-                                    : parsedArgs &&
-                                        typeof parsedArgs.destination === 'string' &&
-                                        parsedArgs.destination.trim().length > 0
-                                        ? parsedArgs.destination.trim()
-                                        : ''
-
-                        pretty = url ? `Opening page “${url}”` : 'Opening page'
-                    } else if (lowerAction.includes('go_back')) {
-                        pretty = 'Going back'
-                    } else if (lowerAction.includes('go_forward')) {
-                        pretty = 'Going forward'
-                    } else if (lowerAction.includes('open_web_browser')) {
-                        pretty = 'Opening browser'
-                    } else if (lowerAction.includes('wait')) {
-                        pretty = 'Waiting'
-                    } else if (lowerAction.includes('key') || lowerAction.includes('keypress')) {
-                        pretty = 'Pressing keys'
-                    } else {
-                        pretty = 'Continuing'
-                    }
-
-                    prettyLines.push(pretty)
+                for (const step of parsed.steps) {
+                    setNavigationStepCurrent(step.current)
+                    setNavigationStepTotal(step.total)
                 }
+
+                const prettyLines = parsed.prettyLines
 
                 if (prettyLines.length > 0) {
                     setNavigation((prevNav) => {

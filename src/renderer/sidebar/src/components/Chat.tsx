@@ -445,7 +445,7 @@ const ConversationTurnComponent: React.FC<{
 
                         <div
                             className={cn(
-                                "origin-bottom transition-all duration-200",
+                                "origin-top transition-all duration-200",
                                 isReasoningCollapsed
                                     ? "scale-y-0 opacity-0 max-h-0 pointer-events-none"
                                     : "scale-y-100 opacity-100 max-h-[1000px]"
@@ -512,7 +512,7 @@ const ConversationTurnComponent: React.FC<{
 
                         <div
                             className={cn(
-                                "origin-bottom transition-all duration-200",
+                                "origin-top transition-all duration-200",
                                 isNavigationCollapsed
                                     ? "scale-y-0 opacity-0 max-h-0 pointer-events-none"
                                     : "scale-y-100 opacity-100 max-h-[1000px]"

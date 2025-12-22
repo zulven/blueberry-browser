@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { ArrowLeft, ArrowRight, RefreshCw, Loader2, PanelLeftClose, PanelLeft } from 'lucide-react'
+import { ArrowLeft, ArrowRight, RefreshCw, Loader2, PanelLeftClose, PanelLeft, Maximize2, Sparkles } from 'lucide-react'
 import { useBrowser } from '../contexts/BrowserContext'
 import { ToolBarButton } from '../components/ToolBarButton'
 import { Favicon } from '../components/Favicon'
@@ -12,6 +12,7 @@ export const AddressBar: React.FC = () => {
     const [isEditing, setIsEditing] = useState(false)
     const [isFocused, setIsFocused] = useState(false)
     const [isSidebarOpen, setIsSidebarOpen] = useState(false)
+    const [isLearning, setIsLearning] = useState(false)
 
     // Update URL when active tab changes
     useEffect(() => {
@@ -19,6 +20,22 @@ export const AddressBar: React.FC = () => {
             setUrl(activeTab.url || '')
         }
     }, [activeTab, isEditing])
+
+    useEffect(() => {
+        const handler = (_event: any, active: boolean) => {
+            setIsLearning(Boolean(active))
+        }
+
+        if (window.electron) {
+            window.electron.ipcRenderer.on('self-improvement-learning', handler)
+        }
+
+        return () => {
+            if (window.electron) {
+                window.electron.ipcRenderer.removeListener('self-improvement-learning', handler)
+            }
+        }
+    }, [])
 
     const handleSubmit = (e: React.FormEvent) => {
         e.preventDefault()
@@ -40,7 +57,7 @@ export const AddressBar: React.FC = () => {
         navigateToUrl(finalUrl)
         setIsEditing(false)
         setIsFocused(false)
-            ; (document.activeElement as HTMLElement)?.blur()
+        ; (document.activeElement as HTMLElement)?.blur()
     }
 
     const handleFocus = () => {
@@ -107,6 +124,12 @@ export const AddressBar: React.FC = () => {
         // Send IPC event to toggle sidebar
         if (window.topBarAPI) {
             window.topBarAPI.toggleSidebar()
+        }
+    }
+
+    const resizeTo16by10 = () => {
+        if (window.topBarAPI) {
+            window.topBarAPI.resizeTabContainerTo16by10()
         }
     }
 
@@ -199,6 +222,22 @@ export const AddressBar: React.FC = () => {
 
             {/* Actions Menu */}
             <div className="flex items-center gap-1 app-region-no-drag">
+                {isLearning && (
+                    <div
+                        className={cn(
+                            "mr-1 h-7 px-2 rounded-md flex items-center gap-1.5",
+                            "bg-muted text-muted-foreground",
+                            "border border-border/50"
+                        )}
+                    >
+                        <Sparkles className="size-4 animate-pulse" />
+                        <span className="text-[0.75rem] leading-none">Learning…</span>
+                    </div>
+                )}
+                <ToolBarButton
+                    Icon={Maximize2}
+                    onClick={resizeTo16by10}
+                />
                 <DarkModeToggle />
                 <ToolBarButton
                     Icon={isSidebarOpen ? PanelLeftClose : PanelLeft}
@@ -206,6 +245,7 @@ export const AddressBar: React.FC = () => {
                     toggled={isSidebarOpen}
                 />
             </div>
+
         </>
     )
 }

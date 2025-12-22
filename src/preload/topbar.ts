@@ -31,6 +31,10 @@ const topBarAPI = {
   // Sidebar
   toggleSidebar: () =>
     electronAPI.ipcRenderer.invoke("toggle-sidebar"),
+
+  // Window sizing
+  resizeTabContainerTo16by10: () =>
+    electronAPI.ipcRenderer.invoke("resize-tab-container-16-10"),
 };
 
 // Use `contextBridge` APIs to expose Electron APIs to

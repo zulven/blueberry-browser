@@ -22,7 +22,8 @@ export class GeminiComputerUseAgent {
   async run(params: {
     model: string;
     userPrompt: string;
-    systemInstruction: string;
+    systemInstruction?: string;
+    getSystemInstruction?: () => string | Promise<string>;
     maxSteps: number;
     excludedPredefinedFunctions?: string[];
     callbacks: GeminiComputerUseAgentCallbacks;
@@ -80,11 +81,42 @@ export class GeminiComputerUseAgent {
       if (params.abortSignal?.aborted) return;
       emitNavigation(`Computer Use: step ${step + 1}/${params.maxSteps}...\n`);
 
+      let systemInstructionText = "";
+      try {
+        if (typeof params.getSystemInstruction === "function") {
+          const resolved = params.getSystemInstruction();
+          systemInstructionText =
+            typeof (resolved as any)?.then === "function"
+              ? await (resolved as Promise<string>)
+              : (resolved as string);
+        } else {
+          systemInstructionText = typeof params.systemInstruction === "string" ? params.systemInstruction : "";
+        }
+      } catch {
+        systemInstructionText = typeof params.systemInstruction === "string" ? params.systemInstruction : "";
+      }
+
+      if (callbacks.onLog) {
+        try {
+          callbacks.onLog({
+            type: "system-instruction",
+            step: step + 1,
+            length: typeof systemInstructionText === "string" ? systemInstructionText.length : 0,
+            hasSiteSpecific:
+              typeof systemInstructionText === "string" &&
+              systemInstructionText.includes("### SITE-SPECIFIC SPECIAL INSTRUCTIONS"),
+          });
+        } catch {
+          // ignore
+        }
+      }
+
       const config: any = {
-        systemInstruction: { parts: [{ text: params.systemInstruction }] },
+        systemInstruction: { parts: [{ text: systemInstructionText }] },
+        temperature: 0.7,
         thinkingConfig: {
           includeThoughts: true,
-          thinkingBudget: 1024,
+          thinkingBudget: 2048,
         },
         tools: [
           {

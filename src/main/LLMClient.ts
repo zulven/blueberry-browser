@@ -6,6 +6,9 @@ import { google } from "@ai-sdk/google";
 import { z } from "zod";
 import { Window } from "./Window";
 import { GeminiComputerUseAgent } from "./gemini/GeminiComputerUseAgent";
+import { BERRY_DYNAMIC_PROMPT, getBerrySystemPrompt, setBerrySpecialInstructions } from "./gemini/CuPrompt";
+import { generateSelfImprovementObject } from "./gemini/SelfImprovement";
+import { parseComputerUseNavigationDelta } from "../shared/navigationPretty";
 import * as dotenv from "dotenv";
 import { join } from "path";
 
@@ -63,8 +66,326 @@ export class LLMClient {
   private activeGeminiComputerUseRunId: string | null = null;
   private geminiComputerUseNavigationOverlayBuffer = "";
 
+  private lastGeminiComputerUseFrameTransform: {
+    cropWidthCss: number;
+    cropHeightCss: number;
+    offsetXCss: number;
+    offsetYCss: number;
+    viewportWidthCss: number;
+    viewportHeightCss: number;
+  } | null = null;
+
+  private lastGeminiComputerUseFrameSmall: Buffer | null = null;
+
   private highlightTrackTimer: NodeJS.Timeout | null = null;
   private highlightTrackUrl: string | null = null;
+
+  private selfImprovementPerSite: Record<string, string[]> = {};
+  private selfImprovementInFlightCount = 0;
+
+  private broadcastSelfImprovementLearning(active: boolean): void {
+    try {
+      const wc = this.window?.topBar?.view?.webContents;
+      if (!wc) return;
+      wc.send("self-improvement-learning", active);
+    } catch {
+      // ignore
+    }
+  }
+
+  private bumpSelfImprovementLearning(delta: number): void {
+    const prev = this.selfImprovementInFlightCount;
+    const next = Math.max(0, prev + delta);
+    this.selfImprovementInFlightCount = next;
+
+    if (prev === 0 && next > 0) {
+      this.broadcastSelfImprovementLearning(true);
+    } else if (prev > 0 && next === 0) {
+      this.broadcastSelfImprovementLearning(false);
+    }
+  }
+
+  private normalizeSiteKey(raw: unknown): string {
+    const input = typeof raw === "string" ? raw.trim() : "";
+    if (!input) return "";
+
+    let host = "";
+    try {
+      if (/^https?:\/\//i.test(input)) {
+        host = new URL(input).hostname;
+      } else {
+        host = input;
+      }
+    } catch {
+      host = input;
+    }
+
+    host = host.trim().toLowerCase();
+
+    // If the model returned something like "youtube.com/@foo" or "youtube.com/",
+    // keep only the hostname-ish portion.
+    host = host.replace(/^[a-z]+:\/\//i, "");
+    host = host.split("/")[0] ?? "";
+
+    if (host.startsWith("www.")) host = host.slice(4);
+    return host.trim();
+  }
+
+  private normalizeInstructionBullets(raw: unknown, limit: number): string[] {
+    const arr = Array.isArray(raw) ? raw : [];
+    const normalized = arr
+      .map((b) => (typeof b === "string" ? b.trim() : ""))
+      .filter((b) => b.length > 0)
+      .map((b) => (b.startsWith("-") ? b.replace(/^[-\s]+/, "").trim() : b));
+
+    const canonicalize = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+    const seen = new Set<string>();
+    const deduped: string[] = [];
+    for (const b of normalized) {
+      const key = canonicalize(b);
+      if (!key) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(b);
+    }
+
+    return deduped.slice(0, Math.max(0, limit));
+  }
+
+  private normalizePerSite(raw: unknown): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+    if (!raw || typeof raw !== "object") return out;
+
+    for (const [kRaw, vRaw] of Object.entries(raw as Record<string, unknown>)) {
+      const key = this.normalizeSiteKey(kRaw);
+      if (!key) continue;
+      const bullets = this.normalizeInstructionBullets(vRaw, 12);
+      if (bullets.length === 0) continue;
+      out[key] = bullets;
+    }
+
+    const keys = Object.keys(out);
+    if (keys.length <= 30) return out;
+
+    const limited: Record<string, string[]> = {};
+    for (const k of keys.slice(0, 30)) {
+      limited[k] = out[k];
+    }
+    return limited;
+  }
+
+  private mergePerSiteInstructions(
+    existing: Record<string, string[]>,
+    incoming: Record<string, string[]>
+  ): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+
+    // First, keep only valid non-empty existing entries.
+    if (existing && typeof existing === "object") {
+      for (const [kRaw, vRaw] of Object.entries(existing)) {
+        const k = this.normalizeSiteKey(kRaw);
+        if (!k) continue;
+        const bullets = this.normalizeInstructionBullets(vRaw, 12);
+        if (bullets.length === 0) continue;
+        out[k] = bullets;
+      }
+    }
+
+    for (const [kRaw, vRaw] of Object.entries(incoming && typeof incoming === "object" ? incoming : {})) {
+      const k = this.normalizeSiteKey(kRaw);
+      if (!k) continue;
+      const bullets = this.normalizeInstructionBullets(vRaw, 12);
+      if (bullets.length === 0) continue;
+      out[k] = bullets;
+    }
+
+    const keys = Object.keys(out);
+    if (keys.length <= 30) return out;
+
+    const limited: Record<string, string[]> = {};
+    for (const k of keys.slice(0, 30)) {
+      limited[k] = out[k];
+    }
+    return limited;
+  }
+
+  private getCurrentGeneralInstructions(): string[] {
+    const lines = typeof BERRY_DYNAMIC_PROMPT === "string" ? BERRY_DYNAMIC_PROMPT.split(/\r?\n/) : [];
+    const bullets = lines
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("- "))
+      .map((l) => l.replace(/^[-\s]+/, "").trim());
+    return this.normalizeInstructionBullets(bullets, 20);
+  }
+
+  private shouldRunSelfImprovement(): boolean {
+    const raw = process.env.AI_SELF_IMPROVEMENT_ENABLED;
+    return raw === "1" || raw === "true";
+  }
+
+  private formatGeminiCuConversationForSelfImprovement(contents: any[]): string {
+    if (!Array.isArray(contents) || contents.length === 0) return "";
+
+    const tail = contents.slice(-12);
+    const lines: string[] = [];
+
+    for (const item of tail) {
+      const role = item && typeof item.role === "string" ? item.role : "unknown";
+      const parts = item && Array.isArray(item.parts) ? item.parts : [];
+
+      const partLines: string[] = [];
+      for (const p of parts) {
+        if (!p || typeof p !== "object") continue;
+
+        if (typeof (p as any).text === "string" && (p as any).text.trim().length > 0) {
+          partLines.push((p as any).text.trim());
+          continue;
+        }
+
+        const fc =
+          typeof (p as any).functionCall === "object"
+            ? (p as any).functionCall
+            : typeof (p as any).function_call === "object"
+              ? (p as any).function_call
+              : null;
+        if (fc && typeof fc.name === "string") {
+          const argsText = typeof fc.args === "object" && fc.args ? JSON.stringify(fc.args) : "{}";
+          partLines.push(`[functionCall] ${fc.name} ${argsText}`);
+          continue;
+        }
+
+        const fr = typeof (p as any).functionResponse === "object" ? (p as any).functionResponse : null;
+        if (fr && typeof fr.name === "string") {
+          const respText = typeof fr.response === "object" && fr.response ? JSON.stringify(fr.response) : "{}";
+          partLines.push(`[functionResponse] ${fr.name} ${respText}`);
+          continue;
+        }
+      }
+
+      if (partLines.length === 0) continue;
+      lines.push(`${role.toUpperCase()}: ${partLines.join("\n")}`);
+    }
+
+    return this.truncateText(lines.join("\n\n"), 3000);
+  }
+
+  private enqueueSelfImprovementFromComputerUseRun(params: {
+    messageId: string;
+    userPrompt: string;
+    assistantText: string;
+    navigationTranscript: string;
+    executedActions: Array<{ name: string; args: any; url: string | null }>;
+    durationMs: number;
+    geminiContents?: any[] | null;
+  }): void {
+    if (!this.shouldRunSelfImprovement()) return;
+
+    const apiKey = this.getApiKey();
+    if (!apiKey) return;
+
+    this.bumpSelfImprovementLearning(1);
+
+    void (async () => {
+      try {
+        const transcriptLines: string[] = [];
+        transcriptLines.push(`User: ${params.userPrompt}`);
+
+        const currentState = {
+          general: this.getCurrentGeneralInstructions(),
+          perSite: this.selfImprovementPerSite,
+        };
+        transcriptLines.push("\nCURRENT_INSTRUCTIONS_JSON:\n" + JSON.stringify(currentState, null, 2));
+
+        const convo =
+          Array.isArray(params.geminiContents) && params.geminiContents.length > 0
+            ? this.formatGeminiCuConversationForSelfImprovement(params.geminiContents)
+            : "";
+        if (convo.trim().length > 0) {
+          transcriptLines.push("\nRecent CU conversation (text + tool calls, no images):\n" + convo);
+        }
+
+        if (params.navigationTranscript.trim().length > 0) {
+          transcriptLines.push("\nNavigation log:\n" + this.truncateText(params.navigationTranscript, 2500));
+        }
+
+        if (params.executedActions.length > 0) {
+          const actionLines = params.executedActions.slice(0, 60).map((a, idx) => {
+            const argsText =
+              a && typeof a.args === "object" && a.args
+                ? JSON.stringify(a.args)
+                : "{}";
+            const urlText = typeof a.url === "string" && a.url.length > 0 ? ` @ ${a.url}` : "";
+            return `${idx + 1}. ${a.name}${urlText} ${argsText}`;
+          });
+          transcriptLines.push("\nActions executed:\n" + actionLines.join("\n"));
+        }
+
+        if (params.assistantText.trim().length > 0) {
+          transcriptLines.push(
+            "\nAssistant thoughts/progress + final answer:\n" + this.truncateText(params.assistantText, 3500)
+          );
+        }
+
+        transcriptLines.push(`\nMetadata: durationMs=${params.durationMs}`);
+
+        const prompt =
+          "You are analyzing a browser computer-use agent run. " +
+          "Your job is to produce UPDATED navigation instructions that will help the agent perform better in future runs.\n\n" +
+          "Focus on:\n" +
+          "- Intent capture: how the agent interpreted the user, and how to better capture intent and ambiguity.\n" +
+          "- User preferences: infer stable preferences (tone, level of detail, safety, interaction style) and how to satisfy them.\n" +
+          "- Navigation: assess the agent's step choices and propose rules to improve accuracy and efficiency.\n\n" +
+          "Output rules:\n" +
+          "- Return ONLY JSON (no markdown).\n" +
+          "- Start from CURRENT instructions: preserve existing and append new ones.\n" +
+          "- Remove an existing instruction only if it clearly contradicts a new one.\n" +
+          "- Keep rules short, imperative, and avoid coordinates/selectors.\n\n" +
+          "Run transcript:\n" +
+          transcriptLines.join("\n");
+
+        const modelOverride = process.env.AI_SELF_IMPROVEMENT_MODEL;
+        const obj = await generateSelfImprovementObject({
+          apiKey,
+          model:
+            typeof modelOverride === "string" && modelOverride.trim().length > 0
+              ? modelOverride.trim()
+              : undefined,
+          temperature: 0.2,
+          prompt,
+        });
+
+        const general = this.normalizeInstructionBullets((obj as any)?.general, 20);
+        const perSite = this.normalizePerSite((obj as any)?.perSite);
+        if (general.length === 0 && Object.keys(perSite).length === 0) return;
+
+        if (general.length > 0) {
+          setBerrySpecialInstructions(general);
+        }
+        this.selfImprovementPerSite = this.mergePerSiteInstructions(this.selfImprovementPerSite, perSite);
+
+        if (this.debugStream) {
+          try {
+            console.log(
+              `[SELF_IMPROVEMENT] updated general=${general.length} perSite=${Object.keys(perSite).length} after run ${params.messageId}`
+            );
+          } catch {
+            // ignore
+          }
+        }
+      } catch (e) {
+        if (this.debugStream) {
+          try {
+            const msg = e instanceof Error ? e.message : String(e ?? "");
+            console.warn("[SELF_IMPROVEMENT] failed: " + msg);
+          } catch {
+            // ignore
+          }
+        }
+      } finally {
+        this.bumpSelfImprovementLearning(-1);
+      }
+    })();
+  }
 
   private shouldLogModelInput(): boolean {
     const raw = process.env.AI_LOG_MODEL_INPUT;
@@ -599,10 +920,15 @@ export class LLMClient {
           pageText = null;
         }
 
-        const systemInstruction = this.buildSystemPrompt(tab.url, pageText);
+        const systemInstruction = this.buildComputerUseSystemInstruction({ url: tab.url, pageText });
+        const userPrompt = this.buildComputerUseUserPrompt({
+          url: tab.url,
+          pageText,
+          userMessage: request.message,
+        });
         await this.geminiComputerUseLoop({
           messageId: request.messageId,
-          userPrompt: request.message,
+          userPrompt,
           systemInstruction,
           abortSignal: this.activeRunAbortController.signal,
         });
@@ -736,9 +1062,9 @@ export class LLMClient {
     const parts: string[] = [
       "You are a Berry, a helpful AI assistant integrated into a the Blueberry web browser.",
       "You are able to autnomously navigate the browser and interact with webpages in order to fulfill the user's query when needed.",
-      "You have detailed context about the browser that user might not have.", 
+      "You have detailed context about the browser that the user might not have.", 
       "The user only sees the webpages as they are. So NEVER mention details like coordinates (x=,y=) on a page, only refer to visual queues available to the user",
-      "You reflect before you answer to understand the user full intent and evaluate if you can answer immediately or need to navigate the web/interact with pages.",
+      "You think before you answer to understand the user full intent and evaluate if you can answer immediately or need to navigate the web/interact with pages.",
       "When navigation/interaction is necessary you plan your actions.",
       "If an interaction is risky (editing/deleting... on a non public site), if you are unsure or need the user to provide info/interact, alwyas prompt the user to intervene."
     ];
@@ -772,6 +1098,69 @@ export class LLMClient {
     return text.substring(0, maxLength) + "...";
   }
 
+  private buildComputerUseUserPrompt(params: {
+    url: string | null;
+    pageText: string | null;
+    userMessage: string;
+  }): string {
+    return params.userMessage;
+  }
+
+  private buildComputerUseSystemInstruction(params: {
+    url: string | null;
+    pageText: string | null;
+  }): string {
+    return this.getBerrySystemInstructionWithPageContext(params);
+  }
+
+  private getBerrySystemInstructionWithPageContext(params: {
+    url: string | null;
+    pageText: string | null;
+  }): string {
+    const base = getBerrySystemPrompt();
+    const parts: string[] = [];
+
+    let siteBlock: string | null = null;
+    if (params.url) {
+      try {
+        const host = new URL(params.url).hostname;
+        const hostKey = this.normalizeSiteKey(host);
+        const hostNoWww = hostKey;
+        const siteBullets =
+          (hostKey && this.selfImprovementPerSite[hostKey]) ||
+          (hostNoWww && this.selfImprovementPerSite[hostNoWww]) ||
+          null;
+
+        if (Array.isArray(siteBullets) && siteBullets.length > 0) {
+          siteBlock = `### SITE-SPECIFIC SPECIAL INSTRUCTIONS (${hostNoWww || hostKey})\n${siteBullets
+            .slice(0, 12)
+            .map((b) => `- ${b}`)
+            .join("\n")}`;
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (siteBlock) {
+      parts.push(siteBlock);
+    }
+
+    if (params.url) {
+      parts.push(`Current page URL: ${params.url}`);
+    }
+
+    /*
+    if (params.pageText) {
+      const truncatedText = this.truncateText(params.pageText, MAX_CONTEXT_LENGTH);
+      parts.push(`Page text content (in viewport):\n${truncatedText}`);
+    }
+    */
+
+    if (parts.length === 0) return base;
+    return base + "\n\n" + parts.join("\n\n");
+  }
+
   private isGeminiComputerUseModel(): boolean {
     return (
       this.provider === "google" &&
@@ -783,13 +1172,213 @@ export class LLMClient {
   private denormalizeCoord(value: unknown, max: number): number {
     const n = typeof value === "number" ? value : Number(value);
     if (!Number.isFinite(n)) return 0;
-    return Math.max(0, Math.min(max, Math.round((n / 1000) * max)));
+
+    // Gemini CU usually returns coords in [0..1000], but some providers/variants may
+    // emit fractional coords in [0..1]. Support both.
+    const normalized = n >= 0 && n <= 1 ? n : n / 1000;
+    return Math.max(0, Math.min(max, Math.round(normalized * max)));
   }
 
   private async getActiveTabOrThrow() {
     const tab = this.getTabByIdOrActive(null);
     if (!tab) throw new Error("No active tab available");
     return tab;
+  }
+
+  private async waitForDomReady(tab: any, opts?: { timeoutMs?: number; idleMs?: number }): Promise<void> {
+    const timeoutMs =
+      typeof opts?.timeoutMs === "number" && Number.isFinite(opts.timeoutMs)
+        ? Math.max(250, Math.min(10_000, Math.round(opts.timeoutMs)))
+        : 6500;
+    const idleMs =
+      typeof opts?.idleMs === "number" && Number.isFinite(opts.idleMs)
+        ? Math.max(0, Math.min(1500, Math.round(opts.idleMs)))
+        : 350;
+
+    const settleMs = 250;
+
+    const start = Date.now();
+    let lastBusyAt = Date.now();
+
+    const wc = tab?.webContents;
+    const waitForStopLoading = async (maxWaitMs: number): Promise<void> => {
+      if (!wc || typeof wc.isLoading !== "function") return;
+      if (!wc.isLoading()) return;
+      if (typeof wc.once !== "function" || typeof wc.removeListener !== "function") return;
+      const waitMs = Math.max(0, Math.min(1500, Math.round(maxWaitMs)));
+      if (waitMs <= 0) return;
+
+      await new Promise<void>((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          try {
+            wc.removeListener("did-stop-loading", finish);
+            wc.removeListener("did-finish-load", finish);
+            wc.removeListener("did-fail-load", finish);
+          } catch {
+            // ignore
+          }
+          resolve();
+        };
+
+        try {
+          wc.once("did-stop-loading", finish);
+          wc.once("did-finish-load", finish);
+          wc.once("did-fail-load", finish);
+        } catch {
+          // ignore
+        }
+
+        setTimeout(finish, waitMs);
+      });
+    };
+
+    while (Date.now() - start < timeoutMs) {
+      try {
+        if (this.activeRunAbortController?.signal?.aborted) return;
+      } catch {
+        // ignore
+      }
+
+      let isLoading = false;
+      try {
+        isLoading = Boolean(tab?.webContents?.isLoading?.());
+      } catch {
+        // ignore
+      }
+
+      if (isLoading) {
+        try {
+          await waitForStopLoading(timeoutMs - (Date.now() - start));
+        } catch {
+          // ignore
+        }
+      }
+
+      let readyState: string | null = null;
+      try {
+        const rs = await tab.runJs("document.readyState");
+        readyState = typeof rs === "string" ? rs : null;
+      } catch {
+        // If executeJavaScript is unavailable mid-navigation, treat as busy.
+        readyState = null;
+      }
+
+      const domReady = readyState === "interactive" || readyState === "complete";
+      const busy = isLoading || !domReady;
+
+      if (busy) {
+        lastBusyAt = Date.now();
+      } else if (Date.now() - lastBusyAt >= idleMs) {
+        await new Promise((r) => setTimeout(r, settleMs));
+        let stillLoading = false;
+        try {
+          stillLoading = Boolean(tab?.webContents?.isLoading?.());
+        } catch {
+          stillLoading = false;
+        }
+        let stillReady = false;
+        try {
+          const rs2 = await tab.runJs("document.readyState");
+          stillReady = rs2 === "interactive" || rs2 === "complete";
+        } catch {
+          stillReady = false;
+        }
+        if (!stillLoading && stillReady) return;
+        lastBusyAt = Date.now();
+      }
+
+      await new Promise((r) => setTimeout(r, 75));
+    }
+  }
+
+  private async captureStableTabScreenshot(tab: any, opts?: { timeoutMs?: number; intervalMs?: number }): Promise<any> {
+    const timeoutMs =
+      typeof opts?.timeoutMs === "number" && Number.isFinite(opts.timeoutMs)
+        ? Math.max(250, Math.min(10_000, Math.round(opts.timeoutMs)))
+        : 2000;
+    const intervalMs =
+      typeof opts?.intervalMs === "number" && Number.isFinite(opts.intervalMs)
+        ? Math.max(75, Math.min(1500, Math.round(opts.intervalMs)))
+        : 250;
+
+    const start = Date.now();
+    let prevSmall: Buffer | null = null;
+    let lastFull: any = null;
+
+    const diffRatio = (a: Buffer, b: Buffer): number => {
+      const len = Math.min(a.length, b.length);
+      if (len <= 0) return 1;
+      let sum = 0;
+      let count = 0;
+      const step = 16;
+      for (let i = 0; i + 2 < len; i += step) {
+        sum += Math.abs(a[i] - b[i]);
+        sum += Math.abs(a[i + 1] - b[i + 1]);
+        sum += Math.abs(a[i + 2] - b[i + 2]);
+        count += 3;
+      }
+      if (count <= 0) return 1;
+      return sum / (count * 255);
+    };
+
+    while (Date.now() - start < timeoutMs) {
+      let img: any;
+      try {
+        img = await tab.screenshot();
+      } catch {
+        break;
+      }
+
+      lastFull = img;
+      let smallBuf: Buffer | null = null;
+      try {
+        const small = img.resize({ width: 96, height: 60, quality: "good" });
+        const bmp = small.toBitmap();
+        smallBuf = Buffer.isBuffer(bmp) ? bmp : Buffer.from(bmp);
+      } catch {
+        return lastFull;
+      }
+
+      if (prevSmall) {
+        const d = diffRatio(prevSmall, smallBuf);
+        if (Number.isFinite(d) && d <= 0.018) {
+          return lastFull;
+        }
+      }
+      prevSmall = smallBuf;
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+
+    return lastFull ?? (await tab.screenshot());
+  }
+
+  private computeSmallFrameSignature(image: any): Buffer | null {
+    try {
+      const small = image.resize({ width: 96, height: 60, quality: "good" });
+      const bmp = small.toBitmap();
+      return Buffer.isBuffer(bmp) ? bmp : Buffer.from(bmp);
+    } catch {
+      return null;
+    }
+  }
+
+  private frameSignatureDiffRatio(a: Buffer, b: Buffer): number {
+    const len = Math.min(a.length, b.length);
+    if (len <= 0) return 1;
+    let sum = 0;
+    let count = 0;
+    const step = 16;
+    for (let i = 0; i + 2 < len; i += step) {
+      sum += Math.abs(a[i] - b[i]);
+      sum += Math.abs(a[i + 1] - b[i + 1]);
+      sum += Math.abs(a[i + 2] - b[i + 2]);
+      count += 3;
+    }
+    if (count <= 0) return 1;
+    return sum / (count * 255);
   }
 
   private isValidPngBase64(data: string): boolean {
@@ -831,10 +1420,101 @@ export class LLMClient {
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const tab = await this.getActiveTabOrThrow();
-        const image = await tab.screenshot();
+
+        // Best-effort: avoid capturing half-loaded frames.
+        try {
+          await this.waitForDomReady(tab);
+        } catch {
+          // ignore
+        }
+
+        let viewportWidthCss = DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
+        let viewportHeightCss = DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
+        let viewportDpr = 1;
+        let viewportClientW = 0;
+        let viewportClientH = 0;
+        let viewportInnerW = 0;
+        let viewportInnerH = 0;
+        try {
+          const viewport = await tab.runJs(
+            "(() => ({ w: window.innerWidth || 1440, h: window.innerHeight || 900, cw: document.documentElement && document.documentElement.clientWidth ? document.documentElement.clientWidth : 0, ch: document.documentElement && document.documentElement.clientHeight ? document.documentElement.clientHeight : 0, dpr: window.devicePixelRatio || 1 }))()"
+          );
+          const vw = typeof (viewport as any)?.w === "number" ? (viewport as any).w : DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
+          const vh = typeof (viewport as any)?.h === "number" ? (viewport as any).h : DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
+          const cw = typeof (viewport as any)?.cw === "number" ? (viewport as any).cw : 0;
+          const ch = typeof (viewport as any)?.ch === "number" ? (viewport as any).ch : 0;
+          const dpr = typeof (viewport as any)?.dpr === "number" ? (viewport as any).dpr : 1;
+
+          viewportInnerW = Number.isFinite(vw) && vw > 0 ? vw : 0;
+          viewportInnerH = Number.isFinite(vh) && vh > 0 ? vh : 0;
+          viewportClientW = Number.isFinite(cw) && cw > 0 ? cw : 0;
+          viewportClientH = Number.isFinite(ch) && ch > 0 ? ch : 0;
+          viewportDpr = Number.isFinite(dpr) && dpr > 0.1 ? dpr : 1;
+
+          viewportWidthCss = viewportInnerW || viewportClientW || DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
+          viewportHeightCss = viewportInnerH || viewportClientH || DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
+        } catch {
+          // ignore
+        }
+
+        const image = await this.captureStableTabScreenshot(tab, { timeoutMs: 2000, intervalMs: 250 });
+        this.lastGeminiComputerUseFrameSmall = this.computeSmallFrameSignature(image);
         const size = image.getSize();
-        const width = typeof size?.width === "number" ? size.width : DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
-        const height = typeof size?.height === "number" ? size.height : DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
+        const widthRaw = typeof size?.width === "number" ? size.width : DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
+        const heightRaw = typeof size?.height === "number" ? size.height : DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
+
+        // Align the CSS-space mapping to the screenshot bitmap. window.innerWidth/clientWidth
+        // can differ from the captured bitmap width (e.g. scrollbars/rounding), which causes
+        // systematic coordinate offsets (often on X).
+        if (Number.isFinite(viewportDpr) && viewportDpr > 0.1 && viewportDpr < 8 && widthRaw > 0 && heightRaw > 0) {
+          const derivedW = Math.round(widthRaw / viewportDpr);
+          const derivedH = Math.round(heightRaw / viewportDpr);
+          if (Number.isFinite(derivedW) && derivedW > 0) viewportWidthCss = derivedW;
+          if (Number.isFinite(derivedH) && derivedH > 0) viewportHeightCss = derivedH;
+        }
+
+        const targetAspect =
+          widthRaw > 0 && heightRaw > 0
+            ? widthRaw / heightRaw
+            : DEFAULT_COMPUTER_USE_SCREEN_WIDTH / DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
+        const currentAspect = targetAspect;
+        let cropped = image;
+        let width = widthRaw;
+        let height = heightRaw;
+
+        if (widthRaw > 0 && heightRaw > 0) {
+          if (currentAspect > targetAspect) {
+            const cropWidth = Math.max(1, Math.round(heightRaw * targetAspect));
+            if (cropWidth < widthRaw) {
+              cropped = image.crop({ x: 0, y: 0, width: cropWidth, height: heightRaw });
+              width = cropWidth;
+              height = heightRaw;
+            }
+          } else if (currentAspect < targetAspect) {
+            const cropHeight = Math.max(1, Math.round(widthRaw / targetAspect));
+            if (cropHeight < heightRaw) {
+              cropped = image.crop({ x: 0, y: 0, width: widthRaw, height: cropHeight });
+              width = widthRaw;
+              height = cropHeight;
+            }
+          }
+        }
+
+        // Store a transform for mapping model coordinates back into the live viewport.
+        // We crop from the top-left (trim right/bottom), so offsets are currently 0.
+        const scaleX = widthRaw > 0 ? widthRaw / Math.max(1, viewportWidthCss) : 1;
+        const scaleY = heightRaw > 0 ? heightRaw / Math.max(1, viewportHeightCss) : 1;
+        const cropWidthCss = Math.max(1, Math.round(width / Math.max(0.0001, scaleX)));
+        const cropHeightCss = Math.max(1, Math.round(height / Math.max(0.0001, scaleY)));
+
+        this.lastGeminiComputerUseFrameTransform = {
+          cropWidthCss,
+          cropHeightCss,
+          offsetXCss: 0,
+          offsetYCss: 0,
+          viewportWidthCss,
+          viewportHeightCss,
+        };
 
         const maxW = DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
         const maxH = DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
@@ -842,12 +1522,12 @@ export class LLMClient {
 
         const capped =
           scale < 1
-            ? image.resize({
+            ? cropped.resize({
                 width: Math.max(1, Math.round(width * scale)),
                 height: Math.max(1, Math.round(height * scale)),
                 quality: "best",
               })
-            : image;
+            : cropped;
 
         const cappedSize = capped.getSize();
         const cappedWidth =
@@ -885,6 +1565,21 @@ export class LLMClient {
     const tab = await this.getActiveTabOrThrow();
     const args = action.args ?? {};
 
+    const shouldAbortForFrameDrift = async (): Promise<boolean> => {
+      const prev = this.lastGeminiComputerUseFrameSmall;
+      if (!prev) return false;
+      let img: any;
+      try {
+        img = await tab.screenshot();
+      } catch {
+        return false;
+      }
+      const cur = this.computeSmallFrameSignature(img);
+      if (!cur) return false;
+      const d = this.frameSignatureDiffRatio(prev, cur);
+      return Number.isFinite(d) && d > 0.04;
+    };
+
     // Ensure the tab is focused so keyboard/mouse events go to the page.
     try {
       tab.webContents.focus();
@@ -898,36 +1593,41 @@ export class LLMClient {
     const w = typeof screen?.w === "number" ? screen.w : DEFAULT_COMPUTER_USE_SCREEN_WIDTH;
     const h = typeof screen?.h === "number" ? screen.h : DEFAULT_COMPUTER_USE_SCREEN_HEIGHT;
 
-    const x = this.denormalizeCoord(args.x, w);
-    let y = this.denormalizeCoord(args.y, h);
-    const destX = this.denormalizeCoord(args.destination_x, w);
-    let destY = this.denormalizeCoord(args.destination_y, h);
+    const frame = this.lastGeminiComputerUseFrameTransform;
+    const offsetX = frame && Number.isFinite(frame.offsetXCss) ? frame.offsetXCss : 0;
+    const offsetY = frame && Number.isFinite(frame.offsetYCss) ? frame.offsetYCss : 0;
 
-    const ensureSafeBottomMargin = async (inputY: number): Promise<{ y: number; scrolledBy: number }> => {
-      const safeBottomPx = 160;
-      const threshold = h - safeBottomPx;
-      if (!Number.isFinite(inputY) || inputY <= threshold) return { y: inputY, scrolledBy: 0 };
+    // Prefer the stored frame transform (derived from the screenshot), but fall back to the
+    // live viewport if they disagree (prevents systematic offsets from scrollbars/rounding).
+    let maxX = w;
+    let maxY = h;
+    if (frame && Number.isFinite(frame.cropWidthCss) && Number.isFinite(frame.cropHeightCss)) {
+      const fx = frame.cropWidthCss;
+      const fy = frame.cropHeightCss;
+      const dx = Math.abs(fx - w);
+      const dy = Math.abs(fy - h);
 
-      const desired = Math.max(0, Math.round(inputY - threshold));
-      if (desired <= 0) return { y: inputY, scrolledBy: 0 };
+      const xCloseEnough = dx <= 24 || (w > 0 && dx / w <= 0.08);
+      const yCloseEnough = dy <= 24 || (h > 0 && dy / h <= 0.08);
 
-      const scrolledBy = await tab.runJs(
-        `(() => {
-          const before = window.scrollY || 0;
-          try {
-            window.scrollBy({ top: ${desired}, left: 0, behavior: 'instant' });
-          } catch {
-            window.scrollBy(0, ${desired});
-          }
-          const after = window.scrollY || 0;
-          return after - before;
-        })()`
-      );
+      maxX = xCloseEnough ? fx : w;
+      maxY = yCloseEnough ? fy : h;
+    }
 
-      const actual = typeof scrolledBy === "number" ? scrolledBy : Number(scrolledBy);
-      const applied = Number.isFinite(actual) ? actual : 0;
-      return { y: Math.max(0, inputY - applied), scrolledBy: applied };
-    };
+    const viewportMaxX = Math.max(0, Math.floor(w) - 1);
+    const viewportMaxY = Math.max(0, Math.floor(h) - 1);
+    const denormMaxX = Math.max(0, Math.floor(maxX) - 1);
+    const denormMaxY = Math.max(0, Math.floor(maxY) - 1);
+
+    const clampToViewportX = (v: number): number =>
+      Number.isFinite(v) ? Math.max(0, Math.min(viewportMaxX, Math.round(v))) : 0;
+    const clampToViewportY = (v: number): number =>
+      Number.isFinite(v) ? Math.max(0, Math.min(viewportMaxY, Math.round(v))) : 0;
+
+    const x = clampToViewportX(offsetX + this.denormalizeCoord(args.x, denormMaxX));
+    const y = clampToViewportY(offsetY + this.denormalizeCoord(args.y, denormMaxY));
+    const destX = clampToViewportX(offsetX + this.denormalizeCoord(args.destination_x, denormMaxX));
+    const destY = clampToViewportY(offsetY + this.denormalizeCoord(args.destination_y, denormMaxY));
 
     const sendKey = (keyCode: string, modifiers?: Array<"shift" | "control" | "alt" | "meta">) => {
       tab.webContents.sendInputEvent({ type: "keyDown", keyCode, modifiers });
@@ -1009,8 +1709,18 @@ export class LLMClient {
         }
         case "click_at":
         case "hover_at": {
-          const adjusted = await ensureSafeBottomMargin(y);
-          y = adjusted.y;
+          try {
+            await this.waitForDomReady(tab, { timeoutMs: 1200, idleMs: 250 });
+          } catch {
+            // ignore
+          }
+
+          if (await shouldAbortForFrameDrift()) {
+            return { name: action.name, response: { ok: false, error: "Page changed; retry with a fresh screenshot.", url: tab.url } };
+          }
+
+          const clickX = x;
+          const clickY = y;
 
           if (action.name === "hover_at") {
             if (this.activeGeminiComputerUseRunId) {
@@ -1018,29 +1728,47 @@ export class LLMClient {
                 type: "pointer",
                 runId: this.activeGeminiComputerUseRunId,
                 mode: "pointer",
-                x,
-                y,
+                x: clickX,
+                y: clickY,
               });
-              await this.startHighlightTracking(tab, x, y);
+              await this.startHighlightTracking(tab, clickX, clickY);
             }
-            tab.webContents.sendInputEvent({ type: "mouseMove", x, y });
-            return { name: action.name, response: { ok: true, x, y, type: "mousemove", url: tab.url } };
+            tab.webContents.sendInputEvent({ type: "mouseMove", x: clickX, y: clickY });
+            return {
+              name: action.name,
+              response: { ok: true, x: clickX, y: clickY, type: "mousemove", url: tab.url },
+            };
           }
 
-          tab.webContents.sendInputEvent({ type: "mouseMove", x, y });
-          tab.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
-          tab.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 1 });
+          tab.webContents.sendInputEvent({ type: "mouseMove", x: clickX, y: clickY });
+          tab.webContents.sendInputEvent({
+            type: "mouseDown",
+            x: clickX,
+            y: clickY,
+            button: "left",
+            clickCount: 1,
+          });
+          tab.webContents.sendInputEvent({
+            type: "mouseUp",
+            x: clickX,
+            y: clickY,
+            button: "left",
+            clickCount: 1,
+          });
           if (this.activeGeminiComputerUseRunId) {
             await this.sendOverlayEvent({
               type: "pointer",
               runId: this.activeGeminiComputerUseRunId,
               mode: "pointer",
-              x,
-              y,
+              x: clickX,
+              y: clickY,
             });
-            await this.startHighlightTracking(tab, x, y);
+            await this.startHighlightTracking(tab, clickX, clickY);
           }
-          return { name: action.name, response: { ok: true, x, y, type: "click", url: tab.url } };
+          return {
+            name: action.name,
+            response: { ok: true, x: clickX, y: clickY, type: "click", url: tab.url },
+          };
         }
 
         case "type_text_at": {
@@ -1049,25 +1777,43 @@ export class LLMClient {
           const clearBefore =
             typeof args.clear_before_typing === "boolean" ? args.clear_before_typing : false;
 
-          const adjusted = await ensureSafeBottomMargin(y);
-          y = adjusted.y;
+          try {
+            await this.waitForDomReady(tab, { timeoutMs: 1200, idleMs: 250 });
+          } catch {
+            // ignore
+          }
+
+          const clickX = x;
+          const clickY = y;
 
           if (this.activeGeminiComputerUseRunId) {
             await this.sendOverlayEvent({
               type: "pointer",
               runId: this.activeGeminiComputerUseRunId,
               mode: "text",
-              x,
-              y,
+              x: clickX,
+              y: clickY,
             });
-            await this.startHighlightTracking(tab, x, y);
+            await this.startHighlightTracking(tab, clickX, clickY);
           }
 
           // Focus the element by clicking, then type using real input events.
-          tab.webContents.sendInputEvent({ type: "mouseMove", x, y });
+          tab.webContents.sendInputEvent({ type: "mouseMove", x: clickX, y: clickY });
           // Many complex apps (e.g. Google Sheets) require a double-click to enter edit mode.
-          tab.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 2 });
-          tab.webContents.sendInputEvent({ type: "mouseUp", x, y, button: "left", clickCount: 2 });
+          tab.webContents.sendInputEvent({
+            type: "mouseDown",
+            x: clickX,
+            y: clickY,
+            button: "left",
+            clickCount: 2,
+          });
+          tab.webContents.sendInputEvent({
+            type: "mouseUp",
+            x: clickX,
+            y: clickY,
+            button: "left",
+            clickCount: 2,
+          });
           await new Promise((r) => setTimeout(r, 120));
 
           if (clearBefore) {
@@ -1094,7 +1840,7 @@ export class LLMClient {
             sendKey("Enter");
           }
 
-          return { name: action.name, response: { ok: true, x, y, url: tab.url } };
+          return { name: action.name, response: { ok: true, x: clickX, y: clickY, url: tab.url } };
         }
 
         case "scroll_document": {
@@ -1198,21 +1944,26 @@ export class LLMClient {
           if (parts.includes("meta") || parts.includes("command") || parts.includes("cmd")) modifiers.push("meta");
           if (parts.includes("shift")) modifiers.push("shift");
           if (parts.includes("alt")) modifiers.push("alt");
+          await new Promise((r) => setTimeout(r, 50));
           sendKey(key.length > 0 ? key : "Unidentified", modifiers);
           return { name: action.name, response: { ok: true, keys, url: tab.url } };
         }
 
         case "drag_and_drop": {
-          const adjustedFrom = await ensureSafeBottomMargin(y);
-          y = adjustedFrom.y;
-          const adjustedTo = await ensureSafeBottomMargin(destY);
-          destY = adjustedTo.y;
+          try {
+            await this.waitForDomReady(tab, { timeoutMs: 1200, idleMs: 250 });
+          } catch {
+            // ignore
+          }
 
+          if (await shouldAbortForFrameDrift()) {
+            return { name: action.name, response: { ok: false, error: "Page changed; retry with a fresh screenshot.", url: tab.url } };
+          }
+          await new Promise((r) => setTimeout(r, 50));
           tab.webContents.sendInputEvent({ type: "mouseMove", x, y });
           tab.webContents.sendInputEvent({ type: "mouseDown", x, y, button: "left", clickCount: 1 });
           tab.webContents.sendInputEvent({ type: "mouseMove", x: destX, y: destY });
           tab.webContents.sendInputEvent({ type: "mouseUp", x: destX, y: destY, button: "left", clickCount: 1 });
-
           if (this.activeGeminiComputerUseRunId) {
             await this.sendOverlayEvent({
               type: "pointer",
@@ -1261,6 +2012,12 @@ export class LLMClient {
     let sentAnyNavigationDelta = false;
     let overlayStarted = false;
     let overlayStartPromise: Promise<void> | null = null;
+
+    const runStartedAt = Date.now();
+    const assistantDrafts: string[] = [];
+    let assistantDraftCurrent = "";
+    let navigationTranscript = "";
+    const executedActions: Array<{ name: string; args: any; url: string | null }> = [];
 
     if (params.abortSignal?.aborted) {
       return;
@@ -1318,10 +2075,48 @@ export class LLMClient {
     };
 
     try {
+      let siStep = 0;
       await agent.run({
         model: this.modelName,
         userPrompt: params.userPrompt,
         systemInstruction: params.systemInstruction,
+        getSystemInstruction: async () => {
+          siStep += 1;
+          const tab = await this.getActiveTabOrThrow();
+
+          let pageText: string | null = null;
+          try {
+            pageText = await tab.getViewportText();
+          } catch {
+            pageText = null;
+          }
+
+          // Recompute on each step so per-site instructions update after navigation.
+          const si = this.buildComputerUseSystemInstruction({
+            url: typeof tab.url === "string" ? tab.url : null,
+            pageText,
+          });
+
+          if (this.shouldLogModelInput()) {
+            try {
+              const marker = "### SITE-SPECIFIC SPECIAL INSTRUCTIONS";
+              const hasSite = typeof si === "string" && si.includes(marker);
+              const url = typeof tab.url === "string" ? tab.url : "";
+              console.log(
+                `[CU_STEP_SYSTEM_INSTRUCTION] step=${siStep} hasSiteSpecific=${hasSite} url=${url}`
+              );
+              if (hasSite) {
+                const idx = si.indexOf(marker);
+                const tail = idx >= 0 ? si.slice(idx) : "";
+                console.log("[CU_STEP_SYSTEM_INSTRUCTION_SITE_BLOCK]\n" + tail);
+              }
+            } catch {
+              // ignore
+            }
+          }
+
+          return si;
+        },
         maxSteps,
         excludedPredefinedFunctions,
         existingContents: this.geminiComputerUseContents,
@@ -1341,6 +2136,11 @@ export class LLMClient {
 
             const tab = await this.getActiveTabOrThrow();
             const currentUrl = tab.url;
+            executedActions.push({
+              name: typeof action?.name === "string" ? action.name : "unknown_action",
+              args: action?.args,
+              url: typeof currentUrl === "string" ? currentUrl : null,
+            });
             const executed = await this.executeComputerUseAction(action);
             if (params.abortSignal?.aborted) {
               throw new Error("aborted");
@@ -1356,14 +2156,24 @@ export class LLMClient {
           onAssistantDelta: (delta) => {
             if (params.abortSignal?.aborted) return;
             if (!delta) return;
+
+            const shouldResetUi = resetAssistantOnNextDelta;
+            if (shouldResetUi) {
+              resetAssistantOnNextDelta = false;
+              if (assistantDraftCurrent.trim().length > 0) {
+                assistantDrafts.push(assistantDraftCurrent);
+              }
+              assistantDraftCurrent = "";
+            }
+
+            assistantDraftCurrent += delta;
             const idx = ensureAssistantMessage();
             const current =
               typeof this.messages[idx]?.content === "string"
                 ? (this.messages[idx].content as string)
                 : "";
 
-            if (resetAssistantOnNextDelta) {
-              resetAssistantOnNextDelta = false;
+            if (shouldResetUi) {
               this.messages[idx] = { role: "assistant", content: delta };
             } else {
               this.messages[idx] = { role: "assistant", content: current + delta };
@@ -1380,6 +2190,7 @@ export class LLMClient {
             if (params.abortSignal?.aborted) return;
             if (!delta) return;
             sentAnyNavigationDelta = true;
+            navigationTranscript += delta;
             this.sendNavigationChunk(params.messageId, { content: delta, isComplete: false });
             if (this.activeGeminiComputerUseRunId) {
               // Start overlay on the first navigation delta (which only happens after first tool call)
@@ -1421,6 +2232,7 @@ export class LLMClient {
         if (this.activeGeminiComputerUseRunId && overlayStarted) {
           await this.clearHighlight(params.messageId);
           this.stopHighlightTracking();
+          await this.sendOverlayEvent({ type: "log", runId: params.messageId, text: "Navigation complete" });
           await this.sendOverlayEvent({ type: "end", runId: params.messageId });
         }
       } catch {
@@ -1434,6 +2246,26 @@ export class LLMClient {
       this.sendNavigationChunk(params.messageId, { content: "", isComplete: true });
     }
     this.sendStreamChunk(params.messageId, { content: "", isComplete: true });
+
+    const allDrafts = [...assistantDrafts, assistantDraftCurrent].filter(
+      (s) => typeof s === "string" && s.length > 0
+    );
+    const assistantTranscript = allDrafts
+      .map((text, idx) => {
+        const isFinal = idx === allDrafts.length - 1;
+        return isFinal ? `FINAL ANSWER:\n${text}` : `THOUGHT ${idx + 1}:\n${text}`;
+      })
+      .join("\n\n");
+
+    this.enqueueSelfImprovementFromComputerUseRun({
+      messageId: params.messageId,
+      userPrompt: params.userPrompt,
+      assistantText: assistantTranscript,
+      navigationTranscript,
+      executedActions,
+      durationMs: Math.max(0, Date.now() - runStartedAt),
+      geminiContents: this.geminiComputerUseContents,
+    });
   }
 
   private async streamResponse(
@@ -1464,11 +2296,16 @@ export class LLMClient {
         pageText = null;
       }
 
-      const systemInstruction = this.buildSystemPrompt(tab.url, pageText);
+      const systemInstruction = this.buildComputerUseSystemInstruction({ url: tab.url, pageText });
+      const prefixedUserPrompt = this.buildComputerUseUserPrompt({
+        url: tab.url,
+        pageText,
+        userMessage: userPrompt || "",
+      });
 
       await this.geminiComputerUseLoop({
         messageId,
-        userPrompt: userPrompt || "",
+        userPrompt: prefixedUserPrompt,
         systemInstruction,
         abortSignal,
       });
@@ -2090,73 +2927,8 @@ export class LLMClient {
   }
 
   private formatComputerUseNavigationForOverlay(delta: string): string[] {
-    this.geminiComputerUseNavigationOverlayBuffer += delta;
-    const parts = this.geminiComputerUseNavigationOverlayBuffer.split(/\r?\n/);
-    const completeLines = parts.slice(0, -1);
-    this.geminiComputerUseNavigationOverlayBuffer = parts[parts.length - 1] ?? "";
-
-    const prettyLines: string[] = [];
-
-    for (const rawLine of completeLines) {
-      const line = rawLine.trim();
-      if (!line) continue;
-
-      const cleaned = line.replace(/^Computer Use\s*:\s*/i, "").trim();
-
-      const stepMatch = cleaned.match(/\bstep\s+(\d+)\s*\/\s*(\d+)\b/i);
-      if (stepMatch) {
-        continue;
-      }
-
-      if (/\bdone\b/i.test(cleaned) && /no more actions/i.test(cleaned)) {
-        prettyLines.push("Navigation complete");
-        continue;
-      }
-
-      const jsonStart = cleaned.indexOf("{");
-      const actionPart = (jsonStart >= 0 ? cleaned.slice(0, jsonStart) : cleaned).trim();
-      const jsonPart = jsonStart >= 0 ? cleaned.slice(jsonStart).trim() : "";
-
-      let parsedArgs: any = null;
-      if (jsonPart) {
-        try {
-          parsedArgs = JSON.parse(jsonPart);
-        } catch {
-          parsedArgs = null;
-        }
-      }
-
-      const lowerAction = actionPart.toLowerCase();
-
-      let pretty = "";
-      if (lowerAction.includes("type_text")) {
-        const text = parsedArgs && typeof parsedArgs.text === "string" ? parsedArgs.text : "";
-        const enter = parsedArgs && typeof parsedArgs.enter === "boolean" ? parsedArgs.enter : false;
-        const safeText = text.length > 0 ? ` “${text}”` : "";
-        pretty = enter ? `Submitting${safeText}` : `Typing${safeText}`;
-      } else if (lowerAction.includes("search")) {
-        pretty = "Searching";
-      } else if (lowerAction.includes("click")) {
-        pretty = "Clicking element";
-      } else if (lowerAction.includes("scroll")) {
-        pretty = "Scrolling";
-      } else if (
-        lowerAction.includes("navigate") ||
-        lowerAction.includes("open_url") ||
-        lowerAction.includes("openurl")
-      ) {
-        pretty = "Opening page";
-      } else if (lowerAction.includes("wait")) {
-        pretty = "Waiting";
-      } else if (lowerAction.includes("key") || lowerAction.includes("keypress")) {
-        pretty = "Pressing keys";
-      } else {
-        pretty = "Continuing";
-      }
-
-      prettyLines.push(pretty);
-    }
-
-    return prettyLines;
+    const parsed = parseComputerUseNavigationDelta(delta, this.geminiComputerUseNavigationOverlayBuffer);
+    this.geminiComputerUseNavigationOverlayBuffer = parsed.nextBuffer;
+    return parsed.prettyLines;
   }
 }

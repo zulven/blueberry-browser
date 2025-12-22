@@ -94,6 +94,18 @@ export class Tab {
     this.webContentsView.setVisible(false);
   }
 
+  setBackgroundColor(color: string): void {
+    try {
+      if (typeof color !== "string" || color.trim().length === 0) return;
+      const wcAny = this.webContentsView.webContents as any;
+      if (wcAny && typeof wcAny.setBackgroundColor === "function") {
+        wcAny.setBackgroundColor(color);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   async screenshot(): Promise<NativeImage> {
     return await this.webContentsView.webContents.capturePage();
   }
